@@ -6,6 +6,9 @@
 
 set -e
 
+# Resolves repository-local paths so the search wrapper works from any working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SEARCH_SCRIPT="${SEARCH_SCRIPT:-$SCRIPT_DIR/search.py}"
 
 # =============================================================================
 # QUERY CONFIGURATION PARAMETERS
@@ -29,7 +32,7 @@ BOOL_MUST_MINIMUM_SHOULD_MATCH="${BOOL_MUST_MINIMUM_SHOULD_MATCH:-50%}"
 ES_HOST="${ES_HOST:-127.0.0.1}"
 ES_PORT="${ES_PORT:-9200}"
 
-DATASET="${DATASET:-pure_text}"
+DATASET="${DATASET:-pure_text}"  # Expected values: fineweb, web, sft, pure_text
 CURRENT_USER="${SLURM_JOB_USER:-$USER}"
 PATH_DATA="${PATH_DATA:-/iopsstor/scratch/cscs/${CURRENT_USER}/es-data-target_brouillon}"
 INPUT_STRING="${INPUT_STRING:-}"
@@ -573,7 +576,8 @@ main() {
 
    if [ -n "$INPUT_STRING" ]; then
     log_info "Running search on direct text input..."
-    if python3 search.py \
+    # Executes the repo-local search entrypoint for direct input mode.
+    if python3 "$SEARCH_SCRIPT" \
         --input-string "$INPUT_STRING" \
         --index-name "$INDEX_NAME" \
         --es-url "$ES_URL" \
@@ -606,7 +610,8 @@ main() {
         fi
     done
 
-    if python3 search.py \
+    # Executes the repo-local search entrypoint for CSV batch mode.
+    if python3 "$SEARCH_SCRIPT" \
         --csv-files $CSV_FILES_ARRAY \
         --index-name "$INDEX_NAME" \
         --es-url "$ES_URL" \

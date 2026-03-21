@@ -435,48 +435,74 @@ def monitor_reindex_task(target_es: Elasticsearch, task_id: str, source_index: s
         logger.error(f"Failed to get final task results: {e}")
         raise
 
+# Loads an explicit target index configuration when merge output must keep web mappings.
+def load_index_config_from_file(config_path: str) -> Dict[str, Any]:
+    """Load an explicit target index configuration from disk."""
+    with open(config_path, 'r') as handle:
+        return json.load(handle)
+
+
+# Removes source-index-only settings before creating a fresh merge target index.
+def sanitize_index_settings(index_settings: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop source-only Elasticsearch settings before creating a new index."""
+    excluded_keys = {
+        'creation_date',
+        'uuid',
+        'version',
+        'provided_name',
+        'routing',
+        'store',
+    }
+
+    sanitized = {
+        key: value for key, value in index_settings.items() if key not in excluded_keys
+    }
+    sanitized['number_of_replicas'] = 0
+    sanitized.setdefault('refresh_interval', '30s')
+    return sanitized
+
+
+# Clones the first source index mapping/settings so merged web metadata is preserved by default.
+def clone_source_index_config(source_es: Elasticsearch, source_index: str) -> Dict[str, Any]:
+    """Clone settings and mappings from an existing source index."""
+    settings_response = source_es.indices.get_settings(index=source_index, request_timeout=60)
+    mappings_response = source_es.indices.get_mapping(index=source_index, request_timeout=60)
+
+    raw_settings = settings_response[source_index]['settings']['index']
+    mappings = mappings_response[source_index]['mappings']
+
+    return {
+        'settings': sanitize_index_settings(raw_settings),
+        'mappings': mappings,
+    }
+
+
+# Provides a last-resort text-only mapping when no explicit or cloned mapping is available.
 def create_simplified_index_config() -> Dict[str, Any]:
-    """
-    Create simplified index configuration for Stage 1 merges to avoid startup issues
-    """
+    """Fallback text-only configuration when no source mapping or config file is available."""
     return {
         'settings': {
-            # Shard configuration - adjusted for target
-            'number_of_shards': 3, # was 60 for fw-edu-score-2 merges, fw-other-high (17 targets) == 3 shards 
+            'number_of_shards': 3,
             'number_of_replicas': 0,
-            'refresh_interval': '30s',  # Keep -1 during indexing, change to 30s after
-            
-            # Index-level settings (matching source)
+            'refresh_interval': '30s',
             'index': {
                 'codec': 'best_compression',
                 'max_result_window': 50000
             },
-            
-            # Complete analysis configuration from source
             'analysis': {
                 'analyzer': {
                     'web_content_analyzer': {
                         'type': 'custom',
-                        'char_filter': [
-                            'html_strip'
-                        ],
+                        'char_filter': ['html_strip'],
                         'tokenizer': 'standard',
-                        'filter': [
-                            'lowercase',
-                            'asciifolding'
-                        ]
+                        'filter': ['lowercase', 'asciifolding']
                     }
                 }
             }
         },
-        
-        # Complete mappings configuration from source
         'mappings': {
             'dynamic': 'false',
-            '_source': {
-                'includes': ['text'],
-                'excludes': []
-            },
+            '_source': {'includes': ['text'], 'excludes': []},
             'properties': {
                 'text': {
                     'type': 'text',
@@ -522,6 +548,8 @@ def remote_reindex_merge(source_configs: List[Dict[str, Any]], target_config: Di
         logger.info("🔍 Validating source clusters and indexes...")
         source_infos = []
         total_source_docs = 0
+        template_source_es = None
+        template_source_index = None
         
         for i, source_config in enumerate(source_configs):
             logger.info(f"Validating source {i+1}/{len(source_configs)}: {source_config['index']}")
@@ -536,6 +564,9 @@ def remote_reindex_merge(source_configs: List[Dict[str, Any]], target_config: Di
                 size_bytes = get_index_size_bytes(source_es, source_config['index'])
                 source_infos.append({**source_config, 'doc_count': doc_count, 'size_bytes': size_bytes})
                 total_source_docs += doc_count
+                if template_source_es is None:
+                    template_source_es = source_es
+                    template_source_index = source_config['index']
                 size_gb = bytes_to_gb(size_bytes)
                 logger.info(f"  ✓ {source_config['index']}: {doc_count:,} documents ({size_gb:.2f} GB)")
             except Exception as e:
@@ -550,20 +581,28 @@ def remote_reindex_merge(source_configs: List[Dict[str, Any]], target_config: Di
         logger.info(f"📦 Total source size: {total_source_size_gb:.2f} GB")
         logger.info(f"   Final shard count: {final_shard_count}")
         
-        # Create or verify target index with simplified configuration
+        # Prefers an explicit config or cloned source mapping so web metadata survives merges.
         logger.info("🏗️ Preparing target index...")
         if target_es.indices.exists(index=target_index, request_timeout=60):
             logger.info(f"Target index '{target_index}' already exists")
         else:
-            config = create_simplified_index_config()
+            if target_config.get('index_config'):
+                logger.info(f"Loading target index configuration from file: {target_config['index_config']}")
+                config = load_index_config_from_file(target_config['index_config'])
+            elif template_source_es is not None and template_source_index is not None:
+                logger.info(f"Cloning target index settings/mappings from source index: {template_source_index}")
+                config = clone_source_index_config(template_source_es, template_source_index)
+            else:
+                logger.warning("Falling back to simplified text-only target mapping; metadata fields may be lost")
+                config = create_simplified_index_config()
             
-            logger.info("Creating target index with simplified configuration...")
+            logger.info("Creating target index...")
             target_es.indices.create(
                 index=target_index,
                 body=config,
                 request_timeout=120
             )
-            logger.info(f"✓ Created target index '{target_index}' with simplified settings")
+            logger.info(f"✓ Created target index '{target_index}'")
 
         # Perform merge operations
         logger.info("🔄 Starting merge operations...")
@@ -649,10 +688,8 @@ def remote_reindex_merge(source_configs: List[Dict[str, Any]], target_config: Di
         logger.info(f"   Total expected documents: {total_source_docs:,}")
         logger.info(f"   Total merged documents: {total_merged_docs:,}")
         logger.info(f"   Final index count: {final_total:,}")
-        logger.info(f"   Final index count: {final_total:,}")
-        logger.info(f"   Final index size: {final_size_gb:.2f} GB")  # NEW
-        logger.info(f"   Total source size: {total_source_size_gb:.2f} GB")  # NEW
-        logger.info(f"   Total duration: {total_duration/60:.1f} minutes")
+        logger.info(f"   Final index size: {final_size_gb:.2f} GB")
+        logger.info(f"   Total source size: {total_source_size_gb:.2f} GB")
         logger.info(f"   Total duration: {total_duration/60:.1f} minutes")
         
         return verification_success and successful_indexes > 0
@@ -677,6 +714,8 @@ def main():
     parser.add_argument("--target-host", default="localhost", help="Target host")
     parser.add_argument("--target-port", type=int, default=9200, help="Target port")
     parser.add_argument("--batch-size", type=int, default=10000, help="Batch size")
+    # Accepts an explicit target mapping file so merged web indexes keep their fields.
+    parser.add_argument("--index-config", help="Optional path to a target index JSON config. If omitted, the first source index mapping/settings are cloned.")
     parser.add_argument("--log-level", default="INFO", 
                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     
@@ -703,7 +742,8 @@ def main():
     target_config = {
         'index': args.target_index,
         'host': args.target_host,
-        'port': args.target_port
+        'port': args.target_port,
+        'index_config': args.index_config
     }
     
     success = remote_reindex_merge(

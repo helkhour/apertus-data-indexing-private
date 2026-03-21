@@ -32,7 +32,7 @@
             "filter": {
                 "url_path_tokenizer": {
                     "type": "pattern_replace",
-                    "pattern": "[/\\-_.]",
+                    "pattern": "[/\\\\-_.]",
                     "replacement": " "
                 }
             }
@@ -41,7 +41,25 @@
     "mappings": {
         "dynamic": "false",
         "_source": {
-            "includes": ["text", "url"],
+            "includes": [
+                "text",
+                "document_id",
+                "url",
+                "domain",
+                "path",
+                "path_depth",
+                "path_prefixes",
+                "query",
+                "source",
+                "title",
+                "lang",
+                "date",
+                "content_hash",
+                "robots_allowed",
+                "matched_rule_prefix",
+                "http_status",
+                "fetch_timestamp"
+            ],
             "excludes": []
         },
         "properties": {
@@ -51,6 +69,9 @@
                 "index_options": "positions",
                 "norms": true,
                 "store": false
+            },
+            "document_id": {
+                "type": "keyword"
             },
             "url": {
                 "type": "text",
@@ -64,6 +85,57 @@
                         "ignore_above": 2048
                     }
                 }
+            },
+            "domain": {
+                "type": "keyword"
+            },
+            "path": {
+                "type": "keyword"
+            },
+            "path_depth": {
+                "type": "integer"
+            },
+            "path_prefixes": {
+                "type": "keyword"
+            },
+            "query": {
+                "type": "keyword"
+            },
+            "source": {
+                "type": "keyword"
+            },
+            "title": {
+                "type": "text",
+                "analyzer": "web_content_analyzer",
+                "fields": {
+                    "keyword": {
+                        "type": "keyword",
+                        "ignore_above": 512
+                    }
+                }
+            },
+            "lang": {
+                "type": "keyword"
+            },
+            "date": {
+                "type": "date",
+                "format": "strict_date_optional_time||epoch_millis"
+            },
+            "content_hash": {
+                "type": "keyword"
+            },
+            "robots_allowed": {
+                "type": "boolean"
+            },
+            "matched_rule_prefix": {
+                "type": "keyword"
+            },
+            "http_status": {
+                "type": "integer"
+            },
+            "fetch_timestamp": {
+                "type": "date",
+                "format": "strict_date_optional_time||epoch_millis"
             }
         }
     }
