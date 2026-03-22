@@ -18,6 +18,10 @@
 
 set -e
 
+# Resolves repository-local scripts so the merge wrapper works from any working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MERGE_SCRIPT="${MERGE_SCRIPT:-$SCRIPT_DIR/merge.py}"
+
 # Configuration - Override these via environment variables
 # CRITICAL: SOURCE_DATA_DIRS should be a space-separated list of directories
 # passed from the job generator via environment variables
@@ -27,6 +31,8 @@ SOURCE_INDEX_PATTERNS="${SOURCE_INDEX_PATTERNS:-}"
 
 MERGE_CLUSTER_PORT="${MERGE_CLUSTER_PORT:-9200}"
 BATCH_SIZE="${BATCH_SIZE:-10000}"
+# Allows callers to force a specific target mapping so merge output preserves web fields deterministically.
+INDEX_CONFIG="${INDEX_CONFIG:-}"
 
 
 # Colors for output
@@ -115,6 +121,8 @@ show_configuration() {
     echo "Target Index: $TARGET_INDEX"
     echo "Target Port: $MERGE_CLUSTER_PORT"
     echo "Batch Size: $BATCH_SIZE"
+    echo "Index Config: ${INDEX_CONFIG:-'(clone first source mapping)'}"
+    echo "Merge Script: $MERGE_SCRIPT"
     echo "========================"
 }
 
@@ -333,16 +341,24 @@ discover_and_merge_indexes() {
     
     log_info "Starting merge with configuration: $json_config"
     
-    # Execute merge with enhanced verification
-    if NO_PROXY="$no_proxy" HTTP_PROXY="" HTTPS_PROXY="" \
-       python3 "/capstor/scratch/cscs/inesaltemir/scripts/merge_indexes/merge.py" \
-           --source-configs "$json_config" \
-           --target-index "$TARGET_INDEX" \
-           --target-host "127.0.0.1" \
-           --target-port "$MERGE_CLUSTER_PORT" \
-           --batch-size "$BATCH_SIZE" \
-           --log-level INFO; then
-        
+    # Builds the repo-local merge command and attaches the explicit target mapping when requested.
+    local -a merge_cmd=(
+        python3 "$MERGE_SCRIPT"
+        --source-configs "$json_config"
+        --target-index "$TARGET_INDEX"
+        --target-host "127.0.0.1"
+        --target-port "$MERGE_CLUSTER_PORT"
+        --batch-size "$BATCH_SIZE"
+        --log-level INFO
+    )
+
+    # Adds the optional merge target mapping so web metadata is not dropped during reindexing.
+    if [ -n "$INDEX_CONFIG" ]; then
+        merge_cmd+=(--index-config "$INDEX_CONFIG")
+    fi
+
+    # Executes the merge through the checked-in Python entrypoint.
+    if NO_PROXY="$no_proxy" HTTP_PROXY="" HTTPS_PROXY="" "${merge_cmd[@]}"; then
         # CRITICAL: Verify merge results
         log_info "=== Verifying Merge Results ==="
         sleep 10  # Wait for final refresh

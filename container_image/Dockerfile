@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
+# Installs the core Elasticsearch and parquet dependencies used by Apertus indexing.
 RUN python3 -m pip install --upgrade pip && \
     python3 -m pip install \
     pandas \
@@ -29,7 +29,13 @@ RUN python3 -m pip install \
     transformers \
     torch \
     tqdm \
-    datasets \ 
+    datasets \
+    && rm -rf ~/.cache/pip
+
+# Installs the rl-webindex-inspired web ingestion dependencies.
+RUN python3 -m pip install \
+    protego \
+    trafilatura \
     && rm -rf ~/.cache/pip
 
 # Ensure curl is executable

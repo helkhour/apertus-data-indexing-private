@@ -396,28 +396,37 @@ class ElasticsearchQueryBenchmark:
             
         return self._make_request('POST', f"{self.index_name}/_search", query)
     
+    # Formats snippet output with URL provenance for URL-aware datasets.
     def extract_hit_snippets_fineweb(self, hits_data: list, max_hits: int = 5) -> str:
-        """Extract top N hit snippets for Fineweb dataset"""
+        """Extract top N hit snippets for URL-aware datasets."""
         if not hits_data:
             return ""
         
         snippets = []
         for i, hit in enumerate(hits_data[:max_hits]):
             score = hit.get('_score', 0)
-            url = hit.get('_source', {}).get('url', 'No URL available')
-            document_id = hit.get('_source', {}).get('document_id', 'No document_id available')
+            source = hit.get('_source', {})
+            url = source.get('url', 'No URL available')
+            document_id = source.get('document_id', 'No document_id available')
+            domain = source.get('domain', 'No domain available')
+            robots_allowed = source.get('robots_allowed', 'unknown')
+            matched_rule_prefix = source.get('matched_rule_prefix', '')
         
             if 'highlight' in hit and 'text' in hit['highlight']:
                 highlighted_fragments = hit['highlight']['text']
                 text_snippet = ' | '.join(highlighted_fragments)
                 snippet_source = "HIGHLIGHTED"
             else:
-                source_text = hit.get('_source', {}).get('text', '')
+                source_text = source.get('text', '')
                 text_snippet = source_text[:300] + ('...' if len(source_text) > 300 else '')
                 snippet_source = "SOURCE_TEXT"
             
             text_snippet = ' '.join(text_snippet.split())
-            snippet_info = f"Hit {i+1} (Score: {score:.3f}, URL: {url}, Document_ID: {document_id}, Type: {snippet_source}): {text_snippet}"
+            snippet_info = (
+                f"Hit {i+1} (Score: {score:.3f}, URL: {url}, Domain: {domain}, "
+                f"Robots_Allowed: {robots_allowed}, Matched_Rule_Prefix: {matched_rule_prefix or 'n/a'}, "
+                f"Document_ID: {document_id}, Type: {snippet_source}): {text_snippet}"
+            )
             snippets.append(snippet_info)
         
         return '\n'.join(snippets)
@@ -488,9 +497,13 @@ class ElasticsearchQueryBenchmark:
             if self.dataset.lower() == 'sft':
                 hit_info['conversation_id'] = hit.get('_source', {}).get('conversation_id', '')
                 hit_info['original_metadata'] = hit.get('_source', {}).get('original_metadata', '')
-            elif self.dataset.lower() == 'fineweb':
+            # Carries URL provenance fields into the saved full-text hit payloads.
+            elif self.dataset.lower() in ['fineweb', 'web']:
                 hit_info['url'] = hit.get('_source', {}).get('url', '')
                 hit_info['document_id'] = hit.get('_source', {}).get('document_id', '')
+                hit_info['domain'] = hit.get('_source', {}).get('domain', '')
+                hit_info['robots_allowed'] = hit.get('_source', {}).get('robots_allowed', None)
+                hit_info['matched_rule_prefix'] = hit.get('_source', {}).get('matched_rule_prefix', '')
             elif self.dataset.lower() == 'pure_text':
                 pass
             
@@ -516,7 +529,8 @@ class ElasticsearchQueryBenchmark:
 
         if hasattr(self, 'dataset') and self.dataset.lower() == 'sft':
             hit_snippets = self.extract_hit_snippets_sft(hits_data)
-        elif hasattr(self, 'dataset') and self.dataset.lower() == 'fineweb':
+        # Routes URL-aware datasets through the provenance-rich snippet formatter.
+        elif hasattr(self, 'dataset') and self.dataset.lower() in ['fineweb', 'web']:
             hit_snippets = self.extract_hit_snippets_fineweb(hits_data)
         elif hasattr(self, 'dataset') and self.dataset.lower() == 'pure_text':
             hit_snippets = self.extract_hit_snippets_pure_text(hits_data)
@@ -650,6 +664,7 @@ class ElasticsearchQueryBenchmark:
         except Exception as e:
             print(f"Error processing CSV file: {e}")
             sys.exit(1)
+    # Allows ad hoc single-query testing against the same search result format.
     def process_string(self, text: str):
         """Process a single raw input string instead of a CSV file."""
         text = text.strip()
@@ -815,8 +830,9 @@ def main():
     parser.add_argument("--config", type=str,
                        help="JSON configuration string for query execution parameters")
     
-    parser.add_argument("--dataset", choices=['fineweb', 'sft', 'pure_text'], default='fineweb',
-                       help="Dataset type: 'fineweb' or 'sft' or 'pure_text' (default: fineweb)")
+    # Adds the explicit web dataset mode so search output always shows page provenance.
+    parser.add_argument("--dataset", choices=['fineweb', 'web', 'sft', 'pure_text'], default='fineweb',
+                       help="Dataset type: 'fineweb', 'web', 'sft', or 'pure_text' (default: fineweb)")
 
     args = parser.parse_args()
 

@@ -22,7 +22,7 @@ CSV_FILES_LIST_FILE="${CSV_FILES_LIST_FILE:-}"
 SCRIPT_PATH="${SCRIPT_PATH:-}"
 
 # Dataset type for field extraction
-DATASET="${DATASET:-pure_text}"  # Can be 'fineweb' or 'sft' or 'pure_text'
+DATASET="${DATASET:-pure_text}"  # Can be 'fineweb', 'web', 'sft', or 'pure_text'
 
 # =============================================================================
 # QUERY EXECUTION CONFIGURATION

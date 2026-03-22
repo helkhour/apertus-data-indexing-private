@@ -13,6 +13,10 @@
 # FineWeb Dataset Indexing Script with Multi-Process Support
 set -e
 
+# Resolves repository-local scripts so the wrapper works from any working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
 # ============================================================================
 # CONFIGURATION PARAMETERS
 # ============================================================================
@@ -24,7 +28,12 @@ ES_HOST="${ES_HOST:-localhost}"
 ES_PORT="${ES_PORT:-9200}"
 INDEX_NAME="${INDEX_NAME:-}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
-
+# Adds the web-indexing selector knobs without changing the legacy text defaults.
+INDEX_CONFIG="${INDEX_CONFIG:-}"
+DATASET_TYPE="${DATASET_TYPE:-text}"
+DOCUMENT_ID_MODE="${DOCUMENT_ID_MODE:-auto}"
+METADATA_FIELDS="${METADATA_FIELDS:-text}"
+INDEXER_SCRIPT="${INDEXER_SCRIPT:-$SCRIPT_DIR/index_with_metadata.py}"
 
 # File range support for parallel processing
 FILE_RANGE_START="${FILE_RANGE_START:-}"
@@ -266,6 +275,11 @@ show_configuration() {
     echo "Batch Size: $BATCH_SIZE" 
     echo "Elasticsearch: $ES_HOST:$ES_PORT" 
     echo "Index Name: $INDEX_NAME"
+    echo "Index Config: ${INDEX_CONFIG:-'(default)'}"
+    echo "Dataset Type: $DATASET_TYPE"
+    echo "Document ID Mode: $DOCUMENT_ID_MODE"
+    echo "Metadata Fields: $METADATA_FIELDS"
+    echo "Indexer Script: $INDEXER_SCRIPT"
     echo "File Start Range: $FILE_RANGE_START"
     echo "File End Range: $FILE_RANGE_END"
     echo "Log Level: $LOG_LEVEL" 
@@ -301,10 +315,8 @@ run_indexing() {
     # Increase file descriptor limit for multi-process
     ulimit -n 65536
     
-    CURRENT_USER="${SLURM_JOB_USER:-$USER}"
-
-    # Base Python command with multi-process parameters
-    base_cmd="python3 /capstor/scratch/cscs/\"$CURRENT_USER\"/apertus-pretraining-data-indexing/scripts/index/index_with_metadata.py \
+    # Builds the metadata-aware indexer command and passes through the web dataset options.
+    base_cmd="python3 \"$INDEXER_SCRIPT\" \
         --data-dir \"$DATA_DIR\" \
         --batch-size $BATCH_SIZE \
         --chunk-size 50000 \
@@ -316,7 +328,9 @@ run_indexing() {
         --thread-count $THREAD_COUNT \
         --queue-size $QUEUE_SIZE \
         --num-workers $NUM_WORKERS \
-	--metadata-fields text"
+        --dataset-type $DATASET_TYPE \
+        --document-id-mode $DOCUMENT_ID_MODE \
+        --metadata-fields $METADATA_FIELDS"
 
     # Add file range arguments if specified
     if [[ -n "$FILE_RANGE_START" && -n "$FILE_RANGE_END" ]]; then
@@ -326,6 +340,15 @@ run_indexing() {
         log_info "Processing all files (no file range specified)"
     fi
 
+    # Attaches an explicit mapping file when the caller wants deterministic target settings.
+    if [[ -n "$INDEX_CONFIG" ]]; then
+        base_cmd+=" --index-config \"$INDEX_CONFIG\""
+        log_info "Using index config: $INDEX_CONFIG"
+    fi
+
+    log_info "Dataset type: $DATASET_TYPE"
+    log_info "Document ID mode: $DOCUMENT_ID_MODE"
+    log_info "Metadata fields mode: $METADATA_FIELDS"
     log_info "Multi-process mode: $NUM_WORKERS workers will parse files in parallel"
 
     # Execute the command

@@ -15,6 +15,10 @@
 # FineWeb Dataset Indexing Script with Multi-Process Support
 set -e
 
+# Resolves repository-local scripts so the legacy dedup wrapper works from any working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INDEXER_SCRIPT="${INDEXER_SCRIPT:-$SCRIPT_DIR/index_with_id.py}"
+
 # ============================================================================
 # CONFIGURATION PARAMETERS
 # ============================================================================
@@ -282,14 +286,16 @@ monitor_resources() {
 
 run_indexing() {
     log_info "Starting FineWeb dataset indexing with multi-process support..."
+    # Warns that this wrapper is for content-deduplicated corpora rather than URL-preserving web pages.
+    log_warn "index_with_id.sh is intended for content-deduplicated corpora and is not the default wrapper for web datasets."
     
     start_time=$(date +%s)
     
     # Increase file descriptor limit for multi-process
     ulimit -n 65536
     
-    # Base Python command with multi-process parameters
-    base_cmd="python3 /capstor/scratch/cscs/inesaltemir/scripts/indexing/index_detokenized_with_id.py \
+    # Builds the legacy content-deduplicated indexer command from the repo-local script.
+    base_cmd="python3 \"$INDEXER_SCRIPT\" \
         --data-dir \"$DATA_DIR\" \
         --batch-size \"$BATCH_SIZE\" \
         --chunk-size 50000 \
