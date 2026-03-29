@@ -10,10 +10,12 @@ import sys
 import time
 import logging
 import gc
+import hashlib
 from pathlib import Path
 from typing import Generator, Dict, Any, List
 import argparse
 import json
+from urllib.parse import urlparse, urlunparse
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -288,49 +290,573 @@ def get_file_range(data_dir_pattern: str, file_range_start: int = None, file_ran
     return selected_files, total_size_gb
 
 
-def _parse_document(row, index_name: str, metadata_fields: str):
-    """Helper function to parse a document row based on metadata_fields mode"""
-    text_str = row['text']
-    
-    # Skip if text is empty/null
+# Lists the explicit web columns read from parquet and indexed into Elasticsearch.
+# These fields let the generic Apertus indexer ingest web exports without
+# importing the web-ingest package at indexing time.
+WEB_EXPLICIT_COLUMNS = [
+    "record_kind",
+    "document_id",
+    "content_id",
+    "requested_url",
+    "url",
+    "requested_urls",
+    "urls",
+    "url_count",
+    "duplicate_url_count",
+    "domain",
+    "domains",
+    "path",
+    "paths",
+    "path_segments",
+    "path_depth",
+    "path_prefixes",
+    "address_prefixes",
+    "query",
+    "queries",
+    "snippet",
+    "snippets",
+    "source",
+    "sources",
+    "title",
+    "titles",
+    "lang",
+    "langs",
+    "date",
+    "dates",
+    "content_hash",
+    "content_hashes",
+    "content_count",
+    "chunk_hashes",
+    "chunk_count",
+    "robots_allowed",
+    "robots_allowed_any",
+    "robots_allowed_all",
+    "train_allowed",
+    "train_allowed_any",
+    "train_allowed_all",
+    "matched_rule_prefix",
+    "matched_rule_prefixes",
+    "matched_rule_type",
+    "matched_rule_types",
+    "matched_rule_address_prefix",
+    "matched_rule_address_prefixes",
+    "robots_txt_url",
+    "robots_txt_urls",
+    "robots_fetched_at",
+    "robots_http_status",
+    "policy_scope",
+    "policy_agents",
+    "http_status",
+    "fetch_timestamp",
+]
+
+
+# Detects pandas-style null values without treating populated containers as empty.
+def _is_null_like(value: Any) -> bool:
+    """Handle pandas/numpy nulls without breaking on list-like values."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    try:
+        nullish = pd.isna(value)
+    except Exception:
+        return False
+    return isinstance(nullish, bool) and nullish
+
+
+# Normalizes parquet scalar and collection values into JSON-safe Python types.
+def _normalize_value(value: Any) -> Any:
+    if _is_null_like(value):
+        return None
+
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+
+    if isinstance(value, str):
+        return value.strip()
+
+    if isinstance(value, dict):
+        normalized = {
+            str(k): _normalize_value(v)
+            for k, v in value.items()
+            if not _is_null_like(v)
+        }
+        return normalized or None
+
+    if isinstance(value, (list, tuple, set)):
+        normalized = [_normalize_value(item) for item in value]
+        normalized = [item for item in normalized if item is not None]
+        return normalized or None
+
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes)):
+        try:
+            converted = value.tolist()
+            if converted is not value:
+                return _normalize_value(converted)
+        except Exception:
+            pass
+
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            pass
+
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+
+    return value
+
+
+# Parses the legacy metadata blob so explicit web columns can fall back cleanly.
+def _parse_metadata_blob(raw_metadata: Any) -> Dict[str, Any]:
+    if _is_null_like(raw_metadata):
+        return {}
+
+    if isinstance(raw_metadata, dict):
+        return raw_metadata
+
+    try:
+        return json.loads(str(raw_metadata))
+    except Exception:
+        return {}
+
+
+# Normalizes array-like metadata fields, accepting JSON-encoded strings from parquet exports.
+def _normalize_list_field(value: Any) -> List[Any]:
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return []
+    if isinstance(normalized, str):
+        try:
+            parsed = json.loads(normalized)
+            if isinstance(parsed, list):
+                items = [_normalize_value(item) for item in parsed]
+                return [item for item in items if item is not None]
+        except Exception:
+            return [normalized]
+        return [normalized]
+    if isinstance(normalized, list):
+        return [item for item in normalized if item is not None]
+    return [normalized]
+
+
+# Returns the first populated element from a normalized list field.
+def _first_list_item(values: List[Any]) -> Any:
+    for value in values:
+        if value not in (None, "", []):
+            return value
+    return None
+
+
+# Normalizes URLs so one web page keeps one stable Elasticsearch identity.
+def _normalize_url(url: str) -> str:
+    normalized = (url or "").strip()
+    if not normalized:
+        return ""
+
+    parsed = urlparse(normalized)
+    scheme = (parsed.scheme or "https").lower()
+    netloc = parsed.netloc.lower()
+
+    if netloc.endswith(":80") and scheme == "http":
+        netloc = netloc[:-3]
+    if netloc.endswith(":443") and scheme == "https":
+        netloc = netloc[:-4]
+
+    path = parsed.path or "/"
+    return urlunparse((scheme, netloc, path, "", parsed.query, ""))
+
+
+# Builds hierarchical path prefixes for subtree-aware web filtering.
+def _build_path_prefixes(path: str) -> List[str]:
+    if not path:
+        return ["/"]
+
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    prefixes = ["/"]
+    parts = _build_path_segments(normalized_path)
+
+    current = ""
+    for part in parts:
+        current = f"{current}/{part}"
+        prefixes.append(current)
+
+    return prefixes
+
+
+# Splits a normalized path into stable directory tokens for tree traversal.
+def _build_path_segments(path: str) -> List[str]:
+    if not path:
+        return []
+    normalized_path = path if path.startswith("/") else f"/{path}"
+    return [part for part in normalized_path.strip("/").split("/") if part]
+
+
+# Builds the combined domain/path tree so Elasticsearch can traverse address prefixes directly.
+def _build_address_prefixes(domain: str, path: str) -> List[str]:
+    normalized_domain = (domain or "").strip().lower()
+    if not normalized_domain:
+        return []
+
+    prefixes = [normalized_domain]
+    for path_prefix in _build_path_prefixes(path):
+        if path_prefix == "/":
+            continue
+        prefixes.append(f"{normalized_domain}{path_prefix}")
+    return prefixes
+
+
+# Computes the full address where the effective robots rule was inherited from.
+def _build_matched_rule_address_prefix(domain: str, matched_rule_prefix: str) -> str:
+    normalized_domain = (domain or "").strip().lower()
+    if not normalized_domain or not matched_rule_prefix:
+        return ""
+    if matched_rule_prefix == "/":
+        return normalized_domain
+    normalized_prefix = matched_rule_prefix if matched_rule_prefix.startswith("/") else f"/{matched_rule_prefix}"
+    return f"{normalized_domain}{normalized_prefix}"
+
+
+# Computes a deterministic content hash for duplicate-text analysis.
+def _stable_content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+# Chooses the Elasticsearch document id based on explicit ids, URL identity, or content hashes.
+def _derive_document_id(
+    explicit_document_id: str,
+    normalized_url: str,
+    content_hash: str,
+    document_id_mode: str,
+) -> str:
+    if explicit_document_id:
+        return explicit_document_id
+
+    if document_id_mode == "content_hash":
+        return content_hash
+
+    if normalized_url:
+        return hashlib.sha256(normalized_url.encode("utf-8")).hexdigest()
+
+    return content_hash
+
+
+# Limits parquet reads to the columns needed for the selected dataset mode.
+def _build_columns_to_read(
+    available_columns: List[str], metadata_fields: str, dataset_type: str
+) -> List[str]:
+    requested_columns = ["text"]
+
+    if dataset_type == "web" or metadata_fields == "web":
+        requested_columns.extend(WEB_EXPLICIT_COLUMNS)
+        requested_columns.append("metadata")
+    elif metadata_fields in ["text-url", "text-url-lang"]:
+        requested_columns.append("metadata")
+
+    return [column for column in requested_columns if column in available_columns]
+
+
+def _parse_document(
+    row,
+    index_name: str,
+    metadata_fields: str,
+    dataset_type: str = "text",
+    document_id_mode: str = "auto",
+):
+    """Parse a parquet row into an Elasticsearch document."""
+    text_str = row["text"]
+
     if pd.isna(text_str) or not str(text_str).strip():
         return None
-    
+
     text_str = str(text_str).strip()
     if len(text_str) > 100000:
         text_str = text_str[:100000] + "... [TRUNCATED]"
-    
-    # Build document source based on mode
+
     doc_source = {"text": text_str}
-    
-    # Extract metadata if needed
+
+    # Maps one parquet row into one URL-preserving web document when web mode is enabled.
+    if dataset_type == "web" or metadata_fields == "web":
+        metadata_dict = _parse_metadata_blob(row.get("metadata"))
+        # `record_kind` distinguishes the two deduplicated web record types:
+        # shared full-content documents and optional shared chunk documents.
+        record_kind = _normalize_value(row.get("record_kind")) or metadata_dict.get("record_kind") or "content"
+        # `requested_url` preserves the discovery URL. `url` is the resolved URL
+        # that defines stored identity, tree prefixes, and the default document id.
+        requested_urls = _normalize_list_field(
+            row.get("requested_urls", metadata_dict.get("requested_urls"))
+        )
+        urls = _normalize_list_field(row.get("urls", metadata_dict.get("urls")))
+        requested_url = _normalize_url(
+            _normalize_value(row.get("requested_url"))
+            or _first_list_item(requested_urls)
+            or metadata_dict.get("requested_url")
+            or _normalize_value(row.get("url"))
+            or metadata_dict.get("url")
+            or ""
+        )
+        url = _normalize_url(
+            _normalize_value(row.get("url"))
+            or _first_list_item(urls)
+            or metadata_dict.get("url")
+            or requested_url
+        )
+        requested_urls = [_normalize_url(item) for item in requested_urls if _normalize_url(item)]
+        urls = [_normalize_url(item) for item in urls if _normalize_url(item)]
+        if requested_url and requested_url not in requested_urls:
+            requested_urls.insert(0, requested_url)
+        if url and url not in urls:
+            urls.insert(0, url)
+        parsed_url = urlparse(url) if url else None
+
+        domains = _normalize_list_field(row.get("domains", metadata_dict.get("domains")))
+        domain = _normalize_value(row.get("domain")) or _first_list_item(domains) or (parsed_url.netloc if parsed_url else "")
+        if domain and domain not in domains:
+            domains.insert(0, domain)
+        paths = _normalize_list_field(row.get("paths", metadata_dict.get("paths")))
+        path = _normalize_value(row.get("path")) or (parsed_url.path if parsed_url else "")
+        if not path:
+            path = _first_list_item(paths)
+        if not path:
+            path = "/"
+        if path and path not in paths:
+            paths.insert(0, path)
+
+        path_segments = _normalize_list_field(
+            row.get("path_segments", metadata_dict.get("path_segments"))
+        )
+        if not path_segments:
+            path_segments = _build_path_segments(path)
+
+        path_prefixes = _normalize_list_field(
+            row.get("path_prefixes", metadata_dict.get("path_prefixes"))
+        )
+        if not path_prefixes:
+            path_prefixes = _build_path_prefixes(path)
+
+        address_prefixes = _normalize_list_field(
+            row.get("address_prefixes", metadata_dict.get("address_prefixes"))
+        )
+        if not address_prefixes:
+            address_prefixes = _build_address_prefixes(domain, path)
+
+        path_depth = _normalize_value(row.get("path_depth"))
+        if path_depth is None:
+            path_depth = len(path_segments)
+
+        content_hash = (
+            _normalize_value(row.get("content_hash"))
+            or metadata_dict.get("content_hash")
+            or _stable_content_hash(text_str)
+        )
+        content_hashes = _normalize_list_field(
+            row.get("content_hashes", metadata_dict.get("content_hashes"))
+        )
+        if content_hash and content_hash not in content_hashes:
+            content_hashes.insert(0, content_hash)
+
+        robots_allowed = _normalize_value(row.get("robots_allowed"))
+        if robots_allowed is None:
+            robots_allowed = _normalize_value(metadata_dict.get("robots_allowed"))
+        robots_allowed_any = _normalize_value(row.get("robots_allowed_any"))
+        if robots_allowed_any is None:
+            robots_allowed_any = _normalize_value(metadata_dict.get("robots_allowed_any"))
+        if robots_allowed_any is None:
+            robots_allowed_any = robots_allowed
+        robots_allowed_all = _normalize_value(row.get("robots_allowed_all"))
+        if robots_allowed_all is None:
+            robots_allowed_all = _normalize_value(metadata_dict.get("robots_allowed_all"))
+        if robots_allowed_all is None:
+            robots_allowed_all = robots_allowed
+        train_allowed = _normalize_value(row.get("train_allowed"))
+        if train_allowed is None:
+            train_allowed = _normalize_value(metadata_dict.get("train_allowed"))
+        if train_allowed is None:
+            train_allowed = robots_allowed
+        train_allowed_any = _normalize_value(row.get("train_allowed_any"))
+        if train_allowed_any is None:
+            train_allowed_any = _normalize_value(metadata_dict.get("train_allowed_any"))
+        if train_allowed_any is None:
+            train_allowed_any = train_allowed
+        train_allowed_all = _normalize_value(row.get("train_allowed_all"))
+        if train_allowed_all is None:
+            train_allowed_all = _normalize_value(metadata_dict.get("train_allowed_all"))
+        if train_allowed_all is None:
+            train_allowed_all = train_allowed
+
+        # Store the matched rule as both a raw prefix and a fully qualified
+        # domain/path address so subtree permission filters are easy to express.
+        matched_rule_prefix = (
+            _normalize_value(row.get("matched_rule_prefix"))
+            or _normalize_value(metadata_dict.get("matched_rule_prefix"))
+        )
+        matched_rule_type = (
+            _normalize_value(row.get("matched_rule_type"))
+            or _normalize_value(metadata_dict.get("matched_rule_type"))
+        )
+        matched_rule_address_prefix = (
+            _normalize_value(row.get("matched_rule_address_prefix"))
+            or _normalize_value(metadata_dict.get("matched_rule_address_prefix"))
+            or _build_matched_rule_address_prefix(domain, matched_rule_prefix)
+        )
+        queries = _normalize_list_field(row.get("queries", metadata_dict.get("queries")))
+        snippets = _normalize_list_field(row.get("snippets", metadata_dict.get("snippets")))
+        sources = _normalize_list_field(row.get("sources", metadata_dict.get("sources")))
+        titles = _normalize_list_field(row.get("titles", metadata_dict.get("titles")))
+        langs = _normalize_list_field(row.get("langs", metadata_dict.get("langs")))
+        dates = _normalize_list_field(row.get("dates", metadata_dict.get("dates")))
+        matched_rule_prefixes = _normalize_list_field(
+            row.get("matched_rule_prefixes", metadata_dict.get("matched_rule_prefixes"))
+        )
+        matched_rule_types = _normalize_list_field(
+            row.get("matched_rule_types", metadata_dict.get("matched_rule_types"))
+        )
+        matched_rule_address_prefixes = _normalize_list_field(
+            row.get("matched_rule_address_prefixes", metadata_dict.get("matched_rule_address_prefixes"))
+        )
+        robots_txt_urls = _normalize_list_field(
+            row.get("robots_txt_urls", metadata_dict.get("robots_txt_urls"))
+        )
+        if matched_rule_prefix and matched_rule_prefix not in matched_rule_prefixes:
+            matched_rule_prefixes.insert(0, matched_rule_prefix)
+        if matched_rule_type and matched_rule_type not in matched_rule_types:
+            matched_rule_types.insert(0, matched_rule_type)
+        if matched_rule_address_prefix and matched_rule_address_prefix not in matched_rule_address_prefixes:
+            matched_rule_address_prefixes.insert(0, matched_rule_address_prefix)
+
+        explicit_document_id = (
+            _normalize_value(row.get("document_id")) or metadata_dict.get("document_id")
+        )
+        content_id = (
+            _normalize_value(row.get("content_id"))
+            or metadata_dict.get("content_id")
+        )
+        # Only full-content records own a single canonical content id. Chunk
+        # records instead point back to many contents through `content_hashes`.
+        if not content_id and record_kind == "content":
+            content_id = content_hash or explicit_document_id
+        resolved_document_id = _derive_document_id(
+            explicit_document_id=explicit_document_id,
+            normalized_url=url,
+            content_hash=content_hash,
+            document_id_mode=document_id_mode,
+        )
+
+        # Only attach non-null values so the ES document stays compact while
+        # still exposing full provenance when the export provides it.
+        web_fields = {
+            "record_kind": record_kind,
+            "document_id": resolved_document_id,
+            "content_id": content_id,
+            "requested_url": requested_url or url,
+            "url": url,
+            "requested_urls": requested_urls,
+            "urls": urls,
+            "url_count": _normalize_value(row.get("url_count")) or metadata_dict.get("url_count") or len(urls),
+            "duplicate_url_count": (
+                _normalize_value(row.get("duplicate_url_count"))
+                or metadata_dict.get("duplicate_url_count")
+                or max(len(urls) - 1, 0)
+            ),
+            "domain": domain,
+            "domains": domains,
+            "path": path,
+            "paths": paths,
+            "path_segments": path_segments,
+            "path_depth": int(path_depth) if path_depth is not None else 0,
+            "path_prefixes": path_prefixes,
+            "address_prefixes": address_prefixes,
+            "query": _normalize_value(row.get("query")) or metadata_dict.get("query"),
+            "queries": queries,
+            "snippet": _normalize_value(row.get("snippet")) or metadata_dict.get("snippet"),
+            "snippets": snippets,
+            "source": _normalize_value(row.get("source")) or metadata_dict.get("source") or "web",
+            "sources": sources,
+            "title": _normalize_value(row.get("title")) or metadata_dict.get("title"),
+            "titles": titles,
+            "lang": _normalize_value(row.get("lang")) or metadata_dict.get("lang"),
+            "langs": langs,
+            "date": _normalize_value(row.get("date")) or metadata_dict.get("date"),
+            "dates": dates,
+            "content_hash": content_hash,
+            "content_hashes": content_hashes,
+            "content_count": (
+                _normalize_value(row.get("content_count"))
+                or metadata_dict.get("content_count")
+                or len(content_hashes)
+            ),
+            "chunk_hashes": _normalize_list_field(
+                row.get("chunk_hashes", metadata_dict.get("chunk_hashes"))
+            ),
+            "chunk_count": (
+                _normalize_value(row.get("chunk_count"))
+                or metadata_dict.get("chunk_count")
+            ),
+            "robots_allowed": robots_allowed,
+            "robots_allowed_any": robots_allowed_any,
+            "robots_allowed_all": robots_allowed_all,
+            "train_allowed": train_allowed,
+            "train_allowed_any": train_allowed_any,
+            "train_allowed_all": train_allowed_all,
+            "matched_rule_prefix": matched_rule_prefix,
+            "matched_rule_prefixes": matched_rule_prefixes,
+            "matched_rule_type": matched_rule_type,
+            "matched_rule_types": matched_rule_types,
+            "matched_rule_address_prefix": matched_rule_address_prefix,
+            "matched_rule_address_prefixes": matched_rule_address_prefixes,
+            "robots_txt_url": (
+                _normalize_value(row.get("robots_txt_url"))
+                or metadata_dict.get("robots_txt_url")
+            ),
+            "robots_txt_urls": robots_txt_urls,
+            "robots_fetched_at": (
+                _normalize_value(row.get("robots_fetched_at"))
+                or metadata_dict.get("robots_fetched_at")
+            ),
+            "robots_http_status": (
+                _normalize_value(row.get("robots_http_status"))
+                or metadata_dict.get("robots_http_status")
+            ),
+            "policy_scope": _normalize_value(row.get("policy_scope")) or metadata_dict.get("policy_scope"),
+            "policy_agents": _normalize_list_field(
+                row.get("policy_agents", metadata_dict.get("policy_agents"))
+            ),
+            "http_status": _normalize_value(row.get("http_status")),
+            "fetch_timestamp": (
+                _normalize_value(row.get("fetch_timestamp"))
+                or metadata_dict.get("fetch_timestamp")
+                or metadata_dict.get("timestamp")
+            ),
+        }
+        if web_fields["chunk_count"] is None and web_fields["chunk_hashes"] is not None:
+            web_fields["chunk_count"] = len(web_fields["chunk_hashes"])
+
+        for key, value in web_fields.items():
+            if value is not None:
+                doc_source[key] = value
+
+        doc = {"_index": index_name, "_source": doc_source}
+        if resolved_document_id:
+            doc["_id"] = resolved_document_id
+        return doc
+
     if metadata_fields in ["text-url", "text-url-lang"]:
-        try:
-            # Try to parse metadata
-            if isinstance(row.get('metadata'), dict):
-                metadata_dict = row['metadata']
-            else:
-                metadata_dict = json.loads(str(row.get('metadata', '{}')))
-            
-            doc_source["url"] = metadata_dict.get('url', '')
-            
-            if metadata_fields == "text-url-lang":
-                doc_source["lang"] = metadata_dict.get('lang', '')
-        except Exception:
-            # If metadata parsing fails, include empty fields
-            doc_source["url"] = ''
-            if metadata_fields == "text-url-lang":
-                doc_source["lang"] = ''
-    
-    doc = {
-        "_index": index_name,
-        "_source": doc_source
-    }
-    return doc
+        metadata_dict = _parse_metadata_blob(row.get("metadata"))
+        doc_source["url"] = metadata_dict.get("url", "")
+
+        if metadata_fields == "text-url-lang":
+            doc_source["lang"] = metadata_dict.get("lang", "")
+
+    return {"_index": index_name, "_source": doc_source}
 
 
 def create_index_config(num_shards: int = 5, num_replicas: int = 0, 
-                       metadata_fields: str = "text") -> Dict[str, Any]:
+                       metadata_fields: str = "text", dataset_type: str = "text") -> Dict[str, Any]:
     """
     Create index configuration based on metadata field selection.
     
@@ -341,9 +867,9 @@ def create_index_config(num_shards: int = 5, num_replicas: int = 0,
             - "text": Only text field
             - "text-url": Text and URL (stored but not indexed)
             - "text-url-lang": Text, URL, and language (stored but not indexed)
+            - "web": Explicit web document fields with URL-preserving document IDs
     """
-    
-    # Build properties based on metadata_fields
+
     properties = {
         "text": {
             "type": "text",
@@ -353,30 +879,109 @@ def create_index_config(num_shards: int = 5, num_replicas: int = 0,
             "store": False
         }
     }
-    
-    # Add URL field (stored, not indexed)
-    if metadata_fields in ["text-url", "text-url-lang"]:
-        properties["url"] = {
-            "type": "keyword",
-            "index": False,
-            "store": False
-        }
-    
-    # Add language field (stored, not indexed)
-    if metadata_fields == "text-url-lang":
-        properties["lang"] = {
-            "type": "keyword",
-            "index": False,
-            "store": False
-        }
-    
-    # Build _source includes based on metadata_fields
-    source_includes = ["text"]
-    if metadata_fields in ["text-url", "text-url-lang"]:
-        source_includes.append("url")
-    if metadata_fields == "text-url-lang":
-        source_includes.append("lang")
-    
+
+    # Extends the default text mapping with explicit web provenance and robots fields.
+    # The keyword tree fields support exact subtree filters, while `text` remains
+    # the main analyzed field for full-text search.
+    if dataset_type == "web" or metadata_fields == "web":
+        properties.update(
+            {
+                "record_kind": {"type": "keyword"},
+                "document_id": {"type": "keyword"},
+                "content_id": {"type": "keyword"},
+                "requested_url": {"type": "keyword", "ignore_above": 2048},
+                "requested_urls": {"type": "keyword", "ignore_above": 2048},
+                "url": {
+                    "type": "text",
+                    "analyzer": "url_analyzer",
+                    "index_options": "docs",
+                    "norms": False,
+                    "store": False,
+                    "fields": {
+                        "keyword": {
+                            "type": "keyword",
+                            "ignore_above": 2048
+                        }
+                    }
+                },
+                "urls": {"type": "keyword", "ignore_above": 2048},
+                "url_count": {"type": "integer"},
+                "duplicate_url_count": {"type": "integer"},
+                "domain": {"type": "keyword"},
+                "domains": {"type": "keyword"},
+                "path": {"type": "keyword"},
+                "paths": {"type": "keyword"},
+                "path_segments": {"type": "keyword"},
+                "path_depth": {"type": "integer"},
+                "path_prefixes": {"type": "keyword"},
+                "address_prefixes": {"type": "keyword"},
+                "query": {"type": "keyword"},
+                "queries": {"type": "keyword"},
+                # Snippets are discovery metadata, not page content, so they are
+                # stored without contributing to search ranking or recall.
+                "snippet": {"type": "text", "index": False},
+                "snippets": {"type": "text", "index": False},
+                "source": {"type": "keyword"},
+                "sources": {"type": "keyword"},
+                "title": {
+                    "type": "text",
+                    "analyzer": "web_content_analyzer",
+                    "fields": {"keyword": {"type": "keyword", "ignore_above": 512}}
+                },
+                "titles": {"type": "text", "index": False},
+                "lang": {"type": "keyword"},
+                "langs": {"type": "keyword"},
+                "date": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+                "dates": {"type": "keyword"},
+                "content_hash": {"type": "keyword"},
+                "content_hashes": {"type": "keyword"},
+                "content_count": {"type": "integer"},
+                "chunk_hashes": {"type": "keyword"},
+                "chunk_count": {"type": "integer"},
+                "robots_allowed": {"type": "boolean"},
+                "robots_allowed_any": {"type": "boolean"},
+                "robots_allowed_all": {"type": "boolean"},
+                "train_allowed": {"type": "boolean"},
+                "train_allowed_any": {"type": "boolean"},
+                "train_allowed_all": {"type": "boolean"},
+                "matched_rule_prefix": {"type": "keyword"},
+                "matched_rule_prefixes": {"type": "keyword"},
+                "matched_rule_type": {"type": "keyword"},
+                "matched_rule_types": {"type": "keyword"},
+                "matched_rule_address_prefix": {"type": "keyword"},
+                "matched_rule_address_prefixes": {"type": "keyword"},
+                "robots_txt_url": {"type": "keyword", "ignore_above": 2048},
+                "robots_txt_urls": {"type": "keyword", "ignore_above": 2048},
+                "robots_fetched_at": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+                "robots_http_status": {"type": "integer"},
+                "policy_scope": {"type": "keyword"},
+                "policy_agents": {"type": "keyword"},
+                "http_status": {"type": "integer"},
+                "fetch_timestamp": {"type": "date", "format": "strict_date_optional_time||epoch_millis"},
+            }
+        )
+        source_includes = ["text"] + WEB_EXPLICIT_COLUMNS
+    else:
+        if metadata_fields in ["text-url", "text-url-lang"]:
+            properties["url"] = {
+                "type": "keyword",
+                "index": False,
+                "store": False
+            }
+
+        if metadata_fields == "text-url-lang":
+            properties["lang"] = {
+                "type": "keyword",
+                "index": False,
+                "store": False
+            }
+
+        source_includes = ["text"]
+        if metadata_fields in ["text-url", "text-url-lang"]:
+            source_includes.append("url")
+        if metadata_fields == "text-url-lang":
+            source_includes.append("lang")
+
     return {
         "settings": {
             "number_of_shards": num_shards,
@@ -393,6 +998,18 @@ def create_index_config(num_shards: int = 5, num_replicas: int = 0,
                         "char_filter": ["html_strip"],
                         "tokenizer": "standard",
                         "filter": ["lowercase", "asciifolding"]
+                    },
+                    "url_analyzer": {
+                        "type": "custom",
+                        "tokenizer": "uax_url_email",
+                        "filter": ["lowercase", "url_path_tokenizer"]
+                    }
+                },
+                "filter": {
+                    "url_path_tokenizer": {
+                        "type": "pattern_replace",
+                        "pattern": "[/\\-_.]",
+                        "replacement": " "
                     }
                 }
             }
@@ -440,7 +1057,7 @@ def calculate_optimal_shards_by_size(data_size_gb: float,
     # Calculate shards needed - ensure at least 1 shard
     optimal_shards = max(1, int(estimated_indexed_size_gb / target_shard_size_gb))
     
-    # CRITICAL: Enforce minimum 2 shards for datasets > 15GB to avoid single-shard bottleneck
+    # Enforce minimum 2 shards for datasets > 15GB to avoid single-shard bottleneck
     if data_size_gb > 15 and optimal_shards < 2:
         optimal_shards = 2
         logger.info(f"Enforcing minimum 2 shards for dataset > 15GB (single-shard bottleneck prevention)")
@@ -474,7 +1091,8 @@ def calculate_optimal_shards_by_size(data_size_gb: float,
 def create_index_with_size_based_shards(es: Elasticsearch, index_name: str, 
                                        total_data_size_gb: float, config_file: str = None,
                                        min_shard_size_gb: float = 10, max_shard_size_gb: float = 50,
-                                       es_expansion_factor: float = 3.0, metadata_fields: str = "text") -> bool:
+                                       es_expansion_factor: float = 3.0, metadata_fields: str = "text",
+                                       dataset_type: str = "text") -> bool:
     """Create Elasticsearch index with size-based dynamic shard count and metadata field support"""
     try:
         if es.indices.exists(index=index_name):
@@ -496,7 +1114,7 @@ def create_index_with_size_based_shards(es: Elasticsearch, index_name: str,
         
         else:
             logging.info("Using default index configuration")
-            config = create_index_config(num_shards=optimal_shards, metadata_fields=metadata_fields)
+            config = create_index_config(num_shards=optimal_shards, metadata_fields=metadata_fields, dataset_type=dataset_type)
         
         
         # Log final configuration
@@ -505,6 +1123,7 @@ def create_index_with_size_based_shards(es: Elasticsearch, index_name: str,
         logging.info(f"  Replicas: {config['settings']['number_of_replicas']}")
         logging.info(f"  Refresh interval: {config['settings']['refresh_interval']}")
         logging.info(f"  Metadata fields: {metadata_fields}")
+        logging.info(f"  Dataset type: {dataset_type}")
         
         es.indices.create(index=index_name, body=config)
         logging.info(f"Created index '{index_name}' with configuration")
@@ -542,7 +1161,8 @@ def force_memory_cleanup():
 
 
 def process_single_parquet_file_streaming(file_path: Path, chunk_size: int, 
-                                        index_name: str, metadata_fields: str = "text") -> Generator[Dict[str, Any], None, None]:
+                                        index_name: str, metadata_fields: str = "text",
+                                        dataset_type: str = "text", document_id_mode: str = "auto") -> Generator[Dict[str, Any], None, None]:
     """
     Process a single parquet file using streaming approach to prevent memory leaks.
     Now includes metadata fields support.
@@ -566,9 +1186,8 @@ def process_single_parquet_file_streaming(file_path: Path, chunk_size: int,
         processed_rows = 0
         
         # Determine which columns to read
-        columns_to_read = ['text']
-        if metadata_fields in ["text-url", "text-url-lang"]:
-            columns_to_read.append('metadata')
+        available_columns = parquet_file.schema.names
+        columns_to_read = _build_columns_to_read(available_columns, metadata_fields, dataset_type)
         
         # Process each row group individually
         for row_group_idx in range(num_row_groups):
@@ -594,7 +1213,7 @@ def process_single_parquet_file_streaming(file_path: Path, chunk_size: int,
                     
                     # Process chunk and yield documents
                     for _, row in chunk.iterrows():
-                        doc = _parse_document(row, index_name, metadata_fields)
+                        doc = _parse_document(row, index_name, metadata_fields, dataset_type, document_id_mode)
                         if doc:
                             yield doc
                     
@@ -697,7 +1316,8 @@ def bulk_index_documents(es: Elasticsearch, doc_generator: Generator, batch_size
 # ============================================================================
 
 def parse_parquet_worker(file_path, chunk_size, index_name, doc_queue, 
-                        docs_parsed_counter, worker_id, stop_event, metadata_fields="text"):
+                        docs_parsed_counter, worker_id, stop_event, metadata_fields="text",
+                        dataset_type="text", document_id_mode="auto"):
     """
     Worker that reads parquet file and puts parsed documents into shared queue.
     Now supports metadata fields.
@@ -717,9 +1337,8 @@ def parse_parquet_worker(file_path, chunk_size, index_name, doc_queue,
         logger.info(f"Worker {worker_id}: File has {total_rows:,} rows in {num_row_groups} row groups")
         
         # Determine which columns to read
-        columns_to_read = ['text']
-        if metadata_fields in ["text-url", "text-url-lang"]:
-            columns_to_read.append('metadata')
+        available_columns = parquet_file.schema.names
+        columns_to_read = _build_columns_to_read(available_columns, metadata_fields, dataset_type)
         
         for row_group_idx in range(num_row_groups):
             if stop_event.is_set():
@@ -746,7 +1365,7 @@ def parse_parquet_worker(file_path, chunk_size, index_name, doc_queue,
                     chunk = df.iloc[start_idx:chunk_end].copy()
                     
                     for _, row in chunk.iterrows():
-                        doc = _parse_document(row, index_name, metadata_fields)
+                        doc = _parse_document(row, index_name, metadata_fields, dataset_type, document_id_mode)
                         if doc:
                             batch_buffer.append(doc)
                             docs_parsed += 1
@@ -790,7 +1409,8 @@ def parse_parquet_worker(file_path, chunk_size, index_name, doc_queue,
         force_memory_cleanup()
 
 def parse_parquet_worker_batch(file_list, chunk_size, index_name, doc_queue, 
-                               docs_parsed_counter, worker_id, stop_event, metadata_fields="text"):
+                               docs_parsed_counter, worker_id, stop_event, metadata_fields="text",
+                               dataset_type="text", document_id_mode="auto"):
     """
     Worker that processes MULTIPLE parquet files and puts parsed documents into shared queue.
     Now supports metadata fields.
@@ -820,9 +1440,8 @@ def parse_parquet_worker_batch(file_list, chunk_size, index_name, doc_queue,
                 logger.info(f"Worker {worker_id}: File has {total_rows:,} rows in {num_row_groups} row groups")
                 
                 # Determine which columns to read
-                columns_to_read = ['text']
-                if metadata_fields in ["text-url", "text-url-lang"]:
-                    columns_to_read.append('metadata')
+                available_columns = parquet_file.schema.names
+                columns_to_read = _build_columns_to_read(available_columns, metadata_fields, dataset_type)
                 
                 for row_group_idx in range(num_row_groups):
                     if stop_event.is_set():
@@ -847,7 +1466,7 @@ def parse_parquet_worker_batch(file_list, chunk_size, index_name, doc_queue,
                             chunk = df.iloc[start_idx:chunk_end].copy()
                             
                             for _, row in chunk.iterrows():
-                                doc = _parse_document(row, index_name, metadata_fields)
+                                doc = _parse_document(row, index_name, metadata_fields, dataset_type, document_id_mode)
                                 if doc:
                                     batch_buffer.append(doc)
                                     docs_parsed += 1
@@ -1003,7 +1622,8 @@ def elasticsearch_consumer(doc_queue, es, batch_size, max_chunk_bytes,
 
 
 def process_file_list(file_list, chunk_size, index_name, es, batch_size,
-                     max_chunk_bytes, thread_count, queue_size, num_workers=1, metadata_fields="text"):
+                     max_chunk_bytes, thread_count, queue_size, num_workers=1, metadata_fields="text",
+                     dataset_type="text", document_id_mode="auto"):
     """
     Process files with multi-process parsing and single ES client.
     Now supports metadata fields.
@@ -1013,7 +1633,7 @@ def process_file_list(file_list, chunk_size, index_name, es, batch_size,
     if not file_list:
         raise ValueError("No files provided to process")
     
-    logger.info(f"Processing {len(file_list)} parquet files with metadata_fields='{metadata_fields}'")
+    logger.info(f"Processing {len(file_list)} parquet files with metadata_fields='{metadata_fields}' and dataset_type='{dataset_type}'")
     
     # Single-process mode (backward compatible)
     if num_workers == 1:
@@ -1027,7 +1647,7 @@ def process_file_list(file_list, chunk_size, index_name, es, batch_size,
             
             try:
                 doc_generator = process_single_parquet_file_streaming(
-                    file_path, chunk_size, index_name, metadata_fields
+                    file_path, chunk_size, index_name, metadata_fields, dataset_type, document_id_mode
                 )
                 
                 file_stats = bulk_index_documents(
@@ -1055,6 +1675,8 @@ def process_file_list(file_list, chunk_size, index_name, es, batch_size,
     logger.info(f"Files: {len(file_list)}")
     logger.info(f"Actual workers: {actual_workers}")
     logger.info(f"Metadata fields: {metadata_fields}")
+    logger.info(f"Dataset type: {dataset_type}")
+    logger.info(f"Document ID mode: {document_id_mode}")
     logger.info(f"Architecture: {actual_workers} parser workers -> shared queue -> 1 ES consumer")
     
     doc_queue = Queue(maxsize=300) 
@@ -1082,7 +1704,7 @@ def process_file_list(file_list, chunk_size, index_name, es, batch_size,
             worker = Process(
                 target=parse_parquet_worker_batch,  
                 args=(worker_files, chunk_size, index_name, doc_queue, 
-                      docs_parsed_counter, worker_id, stop_event, metadata_fields)
+                      docs_parsed_counter, worker_id, stop_event, metadata_fields, dataset_type, document_id_mode)
             )
             worker.start()
             workers.append(worker)
@@ -1186,16 +1808,24 @@ def main():
                        help="Number of parallel parser workers (default: 1). "
                             "Recommended: 6-8 for 10 CPUs")
     
-    # Metadata fields argument
+    # Adds the web dataset flags needed to preserve URL identity during indexing.
+    parser.add_argument("--dataset-type", type=str, default="text", choices=["text", "web"],
+                       help="Dataset type: 'text' for legacy corpora or 'web' for URL-preserving web documents")
+    parser.add_argument("--document-id-mode", type=str, default="auto",
+                       choices=["auto", "url", "content_hash"],
+                       help="How to assign Elasticsearch _id values. 'url' preserves URL provenance, 'content_hash' deduplicates identical text, 'auto' picks the dataset-appropriate default.")
     parser.add_argument("--metadata-fields", type=str, default="text",
-                       choices=["text", "text-url", "text-url-lang"],
-                       help="Which metadata fields to include in index: "
-                            "'text' (text only, default), "
-                            "'text-url' (add URL), or "
-                            "'text-url-lang' (add URL and language). "
-                            "URLs and language are stored but NOT indexed (not searchable).")
+                       choices=["text", "text-url", "text-url-lang", "web"],
+                       help="Which metadata fields to include in index: 'text', 'text-url', 'text-url-lang', or 'web' for explicit web document fields.")
     
     args = parser.parse_args()
+
+    # Aligns the metadata and id defaults with the URL-preserving web indexing path.
+    if args.dataset_type == "web" and args.metadata_fields == "text":
+        args.metadata_fields = "web"
+
+    if args.dataset_type == "web" and args.document_id_mode == "auto":
+        args.document_id_mode = "url"
     
     logger = setup_logging(args.log_level)
     
@@ -1294,6 +1924,8 @@ def main():
     logger.info(f"Queue size: {args.queue_size}")
     logger.info(f"Num workers: {args.num_workers}")
     logger.info(f"Metadata fields: {args.metadata_fields}")
+    logger.info(f"Dataset type: {args.dataset_type}")
+    logger.info(f"Document ID mode: {args.document_id_mode}")
     logger.info(f"Shard size range: {args.min_shard_size}-{args.max_shard_size} GB")
     logger.info(f"ES expansion factor: {args.es_expansion_factor}x")
     
@@ -1316,7 +1948,7 @@ def main():
         if not create_index_with_size_based_shards(
             es, args.index_name, total_data_size_gb, args.index_config,
             args.min_shard_size, args.max_shard_size, args.es_expansion_factor,
-            metadata_fields=args.metadata_fields
+            metadata_fields=args.metadata_fields, dataset_type=args.dataset_type
         ):
             sys.exit(1)
         
@@ -1337,7 +1969,9 @@ def main():
             args.thread_count, 
             args.queue_size,
             args.num_workers,
-            metadata_fields=args.metadata_fields
+            metadata_fields=args.metadata_fields,
+            dataset_type=args.dataset_type,
+            document_id_mode=args.document_id_mode
         )
         
         indexing_end_time = time.time()

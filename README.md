@@ -12,6 +12,7 @@ This is the supporting code for the paper "Getting Your Indices in a Row: Full-T
 &nbsp;&nbsp;&nbsp;&nbsp;|--- *index* \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```index.py```: Indexer script for Elasticsearch with multi-process support. \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```index_with_id.py```: Script with added content-based SHA256 document IDs for deduplication. \
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```index_web_export.py```: Thin wrapper that indexes exported `web-search` parquet with web-specific flags. \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```index.sh```: Script to run indexing for Slurm. \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```index_with_id.sh```: Script to run indexing with id for Slurm. \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```indexing_job_status.py```: Script to automatically evaluate the indexing jobs, detect failures and output statistics. \
@@ -20,7 +21,10 @@ This is the supporting code for the paper "Getting Your Indices in a Row: Full-T
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```merge.sh```: Slurm script to run merge operation. \
 &nbsp;&nbsp;&nbsp;&nbsp;|--- *search* \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```search.py```: Script to perform various search query types across multiple CSV files. \
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```search_web_index.py```: Thin wrapper that searches a web dataset index with URL-aware rendering. \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```search.sh```: . \
+&nbsp;&nbsp;&nbsp;&nbsp;|--- *web_integration* \
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```run_web_search_ingest.py```: Thin integration wrapper around the standalone `web-search` package. \
 -- **results** \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```Indexing_performance```: Results for the indexing operation on the Apertus pre-training data. \
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;|--- ```Search```: Results for the search queries upon constructed indexes. \
@@ -144,3 +148,80 @@ When coding on windows and doing scp, use this to remove Windows CLRF tokens:
 sed -i 's/\r$//' /path/to/index.sh
 ```
 
+## Web Integration
+Web crawling and extraction now live in the standalone `web-search` repo, which should sit beside this repo in the parent directory:
+
+```text
+semesterProject/
+├── apertus-pretraining-data-indexing/
+└── web-search/
+```
+
+- `web-search`: URL discovery, `robots.txt`, fetching, extraction, address-tree metadata, snippet metadata, duplicate-page aggregation, and duplicate-chunk aggregation
+- `apertus-pretraining-data-indexing`: Elasticsearch indexing, search, merge, and integration commands for web and non-web datasets
+
+### What Apertus Expects From `web-search`
+The exported web records stay URL-based and tree-aware. Important fields include:
+- `requested_url`, `url`, `requested_urls`, `urls`
+- `domain`, `path`, `path_segments`, `path_prefixes`, `address_prefixes`
+- `snippet`, `query`, `source`, `title`, `lang`, `date`
+- `robots_allowed`, `train_allowed`, `matched_rule_prefix`, `matched_rule_address_prefix`, `robots_txt_url`
+- `content_hash`, `content_hashes`, `chunk_hashes`
+
+This preserves the requirements that came out of the web-indexing design:
+- addresses behave like a tree under `domain/dir0/dir1/...`
+- `robots.txt` decisions propagate down the tree and stay attached as metadata
+- multiple URLs can point to one shared content entry
+- repeated passages can point to shared chunk entries
+- search-origin snippets remain attached as provenance
+
+### Integration Commands
+Install the standalone crawler package into the same Python environment once:
+
+```bash
+python3 -m pip install -e ../web-search
+```
+
+If you do not install it, `scripts/web_integration/run_web_search_ingest.py` also tries to import directly from the sibling `../web-search` checkout. You can override that location with `WEB_SEARCH_REPO=/path/to/web-search`.
+
+Use the standalone crawler through the Apertus wrapper:
+
+```bash
+python3 scripts/web_integration/run_web_search_ingest.py \
+  --seed-urls-file seed_urls.txt \
+  --output-parquet /tmp/web_fixture.parquet \
+  --chunk-output /tmp/web_fixture_chunks.parquet \
+  --status-output /tmp/web_fixture_status.jsonl \
+  --robots-policy-output /tmp/web_fixture_robots.jsonl
+```
+
+That wrapper keeps Apertus thin by reusing the exact `web-search` CLI arguments and output schema.
+
+Index the exported parquet with the Apertus web wrapper:
+
+```bash
+python3 scripts/index/index_web_export.py \
+  --data-dir /tmp/web_fixture.parquet \
+  --index-name web_fixture
+```
+
+This delegates to `scripts/index/index_with_metadata.py` while pinning the required web flags:
+- `--dataset-type web`
+- `--metadata-fields web`
+
+Search the resulting index with the Apertus web wrapper:
+
+```bash
+python3 scripts/search/search_web_index.py \
+  --es-url http://localhost:9200 \
+  --index-name web_fixture \
+  --input-string "transformer architecture" \
+  --output-dir-base /tmp/web_search_results
+```
+
+This delegates to `scripts/search/search.py` while pinning `--dataset web`, so result output keeps URL provenance visible.
+
+### Notes
+- The generic Apertus indexer remains multi-dataset. Web records are just one dataset type alongside the existing offline corpora.
+- Pages can still be indexed even when not trainable, because the permission decision is carried in metadata rather than being enforced only at query time.
+- `scripts/web_ingest/` remains as feature-branch reference code, but the intended modular path is now the sibling `web-search` repo plus these Apertus integration wrappers.
