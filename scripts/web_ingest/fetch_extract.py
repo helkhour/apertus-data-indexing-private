@@ -1,5 +1,4 @@
 # Fetches allowed pages and extracts readable text and metadata with Trafilatura.
-from __future__ import annotations
 
 import re
 from typing import Optional
@@ -35,6 +34,18 @@ else:
     )
 
 
+def _build_retry(allowed_methods):
+    retry_kwargs = {
+        "total": 3,
+        "backoff_factor": 1.0,
+        "status_forcelist": [429, 500, 502, 503, 504],
+    }
+    try:
+        return Retry(allowed_methods=allowed_methods, **retry_kwargs)
+    except TypeError:  # pragma: no cover - depends on urllib3 version
+        return Retry(method_whitelist=allowed_methods, **retry_kwargs)
+
+
 # Wraps HTTP fetching and Trafilatura extraction behind a bounded, retrying client.
 class PageFetcherExtractor:
     def __init__(
@@ -52,12 +63,7 @@ class PageFetcherExtractor:
         self.session = requests.Session()
 
         # Uses bounded retries so transient page fetch failures do not fail a whole ingest run.
-        retry = Retry(
-            total=3,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
+        retry = _build_retry(["GET"])
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)

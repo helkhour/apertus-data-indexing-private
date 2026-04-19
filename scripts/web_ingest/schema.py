@@ -1,8 +1,6 @@
 # Defines the canonical schema and normalization helpers for web ingest exports.
-from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -111,44 +109,71 @@ DEFAULT_FETCH_USER_AGENT = "ApertusWebIngest/1.0"
 
 
 # Captures one URL candidate returned by RightDao or a seed file.
-@dataclass
 class SearchCandidate:
-    query: str
-    url: str
-    title: Optional[str] = None
-    snippet: Optional[str] = None
-    source: str = "rightdao"
-    rank: Optional[int] = None
+    def __init__(
+        self,
+        query: str,
+        url: str,
+        title: Optional[str] = None,
+        snippet: Optional[str] = None,
+        source: str = "rightdao",
+        rank: Optional[int] = None,
+    ) -> None:
+        self.query = query
+        self.url = url
+        self.title = title
+        self.snippet = snippet
+        self.source = source
+        self.rank = rank
 
 
 # Captures the evaluated robots state for one URL.
-@dataclass
 class RobotsEvaluation:
-    domain: str
-    path: str
-    path_segments: List[str]
-    path_depth: int
-    path_prefixes: List[str]
-    address_prefixes: List[str]
-    robots_allowed: bool
-    train_allowed: bool
-    matched_rule_prefix: Optional[str]
-    matched_rule_type: Optional[str]
-    matched_rule_address_prefix: Optional[str]
-    robots_txt_url: str
-    robots_fetched_at: Optional[str]
-    robots_http_status: Optional[int]
-    policy_scope: str
-    policy_agents: List[str] = field(default_factory=list)
-    error: Optional[str] = None
+    def __init__(
+        self,
+        domain: str,
+        path: str,
+        path_segments: List[str],
+        path_depth: int,
+        path_prefixes: List[str],
+        address_prefixes: List[str],
+        robots_allowed: bool,
+        train_allowed: bool,
+        matched_rule_prefix: Optional[str],
+        matched_rule_type: Optional[str],
+        matched_rule_address_prefix: Optional[str],
+        robots_txt_url: str,
+        robots_fetched_at: Optional[str],
+        robots_http_status: Optional[int],
+        policy_scope: str,
+        policy_agents: Optional[List[str]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        self.domain = domain
+        self.path = path
+        self.path_segments = path_segments
+        self.path_depth = path_depth
+        self.path_prefixes = path_prefixes
+        self.address_prefixes = address_prefixes
+        self.robots_allowed = robots_allowed
+        self.train_allowed = train_allowed
+        self.matched_rule_prefix = matched_rule_prefix
+        self.matched_rule_type = matched_rule_type
+        self.matched_rule_address_prefix = matched_rule_address_prefix
+        self.robots_txt_url = robots_txt_url
+        self.robots_fetched_at = robots_fetched_at
+        self.robots_http_status = robots_http_status
+        self.policy_scope = policy_scope
+        self.policy_agents = list(policy_agents) if policy_agents else []
+        self.error = error
 
 
 # Captures the fetch/extract result before export serialization.
-@dataclass
 class FetchOutcome:
-    status: str
-    record: Optional[Dict[str, Any]]
-    status_record: Dict[str, Any]
+    def __init__(self, status: str, record: Optional[Dict[str, Any]], status_record: Dict[str, Any]) -> None:
+        self.status = status
+        self.record = record
+        self.status_record = status_record
 
 
 # Returns a UTC ISO-8601 timestamp for fetch and cache bookkeeping.

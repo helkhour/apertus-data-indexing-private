@@ -1,5 +1,4 @@
 # Fetches, caches, and evaluates robots.txt policies using the rl-webindex Protego flow.
-from __future__ import annotations
 
 import hashlib
 import json
@@ -46,6 +45,39 @@ else:
     )
 
 
+def _build_retry(allowed_methods: List[str]) -> Retry:
+    retry_kwargs = {
+        "total": 3,
+        "backoff_factor": 1.0,
+        "status_forcelist": [429, 500, 502, 503, 504],
+    }
+    try:
+        return Retry(allowed_methods=allowed_methods, **retry_kwargs)
+    except TypeError:  # pragma: no cover - depends on urllib3 version
+        return Retry(method_whitelist=allowed_methods, **retry_kwargs)
+
+
+def _parse_cached_timestamp(value: str) -> Optional[datetime]:
+    normalized = (value or "").strip()
+    if not normalized:
+        return None
+
+    # Python 3.6 lacks datetime.fromisoformat; support the format emitted by
+    # utcnow_iso() using explicit strptime patterns.
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+0000"
+    else:
+        if len(normalized) >= 6 and normalized[-6] in ("+", "-") and normalized[-3] == ":":
+            normalized = normalized[:-3] + normalized[-2:]
+
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f%z", "%Y-%m-%dT%H:%M:%S%z"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 # Stores one cached robots.txt fetch result per domain.
 class RobotsCache:
     def __init__(
@@ -66,12 +98,7 @@ class RobotsCache:
         self.session = requests.Session()
 
         # Uses bounded retries so transient robots fetch failures do not spin forever.
-        retry = Retry(
-            total=3,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
+        retry = _build_retry(["GET"])
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -199,9 +226,8 @@ class RobotsCache:
         fetched_at = entry.get("robots_fetched_at")
         if not fetched_at:
             return True
-        try:
-            fetched_dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
-        except Exception:
+        fetched_dt = _parse_cached_timestamp(fetched_at)
+        if fetched_dt is None:
             return True
         age_seconds = (datetime.now(timezone.utc) - fetched_dt).total_seconds()
         return age_seconds > self.ttl_seconds

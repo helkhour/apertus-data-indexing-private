@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run Apertus search in web mode so result rendering keeps URL provenance visible."""
 
-from __future__ import annotations
 
 import subprocess
 import sys

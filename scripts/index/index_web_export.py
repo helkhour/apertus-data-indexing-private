@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Index `web-search` exports through the generic Apertus metadata-aware indexer."""
 
-from __future__ import annotations
 
 import subprocess
 import sys

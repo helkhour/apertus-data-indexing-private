@@ -3,7 +3,6 @@
 Canonical MemoryRecord builders for dataset and web artifact ingestion.
 """
 
-from __future__ import annotations
 
 import hashlib
 import json

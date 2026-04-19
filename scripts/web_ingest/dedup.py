@@ -1,5 +1,4 @@
 # Aggregates per-URL fetch results into shared content records and optional chunk records.
-from __future__ import annotations
 
 import re
 from typing import Any, Dict, Iterable, List, Tuple

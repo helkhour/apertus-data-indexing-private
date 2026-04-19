@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Run the external `web-search` package from inside the Apertus repo."""
 
-from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
+from typing import List
 
 
 # Accept either an installed package or the intended sibling-repo layout:
@@ -17,7 +17,7 @@ from pathlib import Path
 # works during the transition while users move the standalone repo out.
 def _bootstrap_web_search_imports() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    candidate_roots: list[Path] = []
+    candidate_roots = []  # type: List[Path]
 
     configured_repo = os.environ.get("WEB_SEARCH_REPO")
     if configured_repo:

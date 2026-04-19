@@ -1,5 +1,4 @@
 # Orchestrates query -> candidate URLs -> robots check -> fetch/extract -> parquet export.
-from __future__ import annotations
 
 import argparse
 import csv

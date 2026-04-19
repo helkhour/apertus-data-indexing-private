@@ -1,9 +1,7 @@
 # Provides a low-rate RightDao adapter that returns deduplicated URL candidates.
-from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import requests
@@ -19,21 +17,48 @@ else:
 
 
 # Collects the configurable RightDao API settings in one place.
-@dataclass
 class RightDaoConfig:
-    base_url: str
-    api_key: Optional[str] = None
-    method: str = "GET"
-    query_param: str = "q"
-    limit_param: str = "limit"
-    results_key: str = "results"
-    url_key: str = "url"
-    title_key: str = "title"
-    snippet_key: str = "snippet"
-    source_name: str = "rightdao"
-    timeout: int = 30
-    per_query_cap: int = 10
-    min_interval_seconds: float = 1.0
+    def __init__(
+        self,
+        base_url: str,
+        api_key: Optional[str] = None,
+        method: str = "GET",
+        query_param: str = "q",
+        limit_param: str = "limit",
+        results_key: str = "results",
+        url_key: str = "url",
+        title_key: str = "title",
+        snippet_key: str = "snippet",
+        source_name: str = "rightdao",
+        timeout: int = 30,
+        per_query_cap: int = 10,
+        min_interval_seconds: float = 1.0,
+    ) -> None:
+        self.base_url = base_url
+        self.api_key = api_key
+        self.method = method
+        self.query_param = query_param
+        self.limit_param = limit_param
+        self.results_key = results_key
+        self.url_key = url_key
+        self.title_key = title_key
+        self.snippet_key = snippet_key
+        self.source_name = source_name
+        self.timeout = timeout
+        self.per_query_cap = per_query_cap
+        self.min_interval_seconds = min_interval_seconds
+
+
+def _build_retry(allowed_methods: List[str]) -> Retry:
+    retry_kwargs = {
+        "total": 3,
+        "backoff_factor": 1.0,
+        "status_forcelist": [429, 500, 502, 503, 504],
+    }
+    try:
+        return Retry(allowed_methods=allowed_methods, **retry_kwargs)
+    except TypeError:  # pragma: no cover - depends on urllib3 version
+        return Retry(method_whitelist=allowed_methods, **retry_kwargs)
 
 
 # Wraps the RightDao HTTP API behind a conservative, retrying client.
@@ -44,12 +69,7 @@ class RightDaoClient:
         self._last_request_ts = 0.0
 
         # Uses bounded retries so transient upstream failures do not fail a whole ingest run.
-        retry = Retry(
-            total=3,
-            backoff_factor=1.0,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET", "POST"],
-        )
+        retry = _build_retry(["GET", "POST"])
         adapter = HTTPAdapter(max_retries=retry)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
