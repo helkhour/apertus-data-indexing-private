@@ -1,0 +1,66 @@
+{
+  "settings": {
+    "number_of_shards": 6,
+    "number_of_replicas": 0,
+    "refresh_interval": "60s",
+    "index": {
+      "codec": "best_compression",
+      "max_result_window": 50000
+    },
+    "analysis": {
+      "analyzer": {
+        "memory_text_analyzer": {
+          "type": "custom",
+          "char_filter": ["html_strip"],
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        },
+        "memory_exact_analyzer": {
+          "type": "custom",
+          "char_filter": ["html_strip"],
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "false",
+    "_source": {
+      "includes": [
+        "record_id",
+        "parent_id",
+        "record_type",
+        "source_type",
+        "search_text",
+        "data",
+        "representations",
+        "agent"
+      ],
+      "excludes": []
+    },
+    "properties": {
+      "record_id": { "type": "keyword" },
+      "parent_id": { "type": "keyword" },
+      "record_type": { "type": "keyword" },
+      "source_type": { "type": "keyword" },
+      "search_text": {
+        "type": "text",
+        "analyzer": "memory_text_analyzer",
+        "index_options": "positions",
+        "norms": true,
+        "store": false,
+        "fields": {
+          "exact": {
+            "type": "text",
+            "analyzer": "memory_exact_analyzer",
+            "index_options": "positions"
+          }
+        }
+      },
+      "data": { "type": "object" },
+      "representations": { "type": "object" },
+      "agent": { "type": "object" }
+    }
+  }
+}

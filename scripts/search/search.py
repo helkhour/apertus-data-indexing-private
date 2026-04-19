@@ -20,11 +20,23 @@ import argparse
 import os
 
 class ElasticsearchQueryBenchmark:
-    def __init__(self, es_url: str, index_name: str, dataset: str, config: Dict[str, Any] = None):
+    def __init__(
+        self,
+        es_url: str,
+        index_name: str,
+        dataset: str,
+        config: Dict[str, Any] = None,
+        search_field: str = "search_text",
+        fallback_search_field: str = "text",
+        exclude_record_types: List[str] = None,
+    ):
         self.es_url = es_url.rstrip('/')
         self.index_name = index_name
         self.dataset = dataset.lower()  
         self.results = []
+        self.search_field = search_field
+        self.fallback_search_field = fallback_search_field
+        self.exclude_record_types = exclude_record_types or ["status"]
 
         # Optimizations for large index
         self.request_timeout = 60  
@@ -41,7 +53,10 @@ class ElasticsearchQueryBenchmark:
             'match_phrase_slop': [0],
             'bool_must_operator': 'and',
             'bool_must_max_words': 3,
-            'bool_must_minimum_should_match': None
+            'bool_must_minimum_should_match': None,
+            'search_field': self.search_field,
+            'fallback_search_field': self.fallback_search_field,
+            'exclude_record_types': self.exclude_record_types,
         }
         
         # Update with provided config
@@ -51,6 +66,16 @@ class ElasticsearchQueryBenchmark:
         # Set configuration as instance variables
         for key, value in default_config.items():
             setattr(self, key, value)
+
+        self.search_field = str(self.search_field or "search_text")
+        self.fallback_search_field = str(self.fallback_search_field or "").strip() or None
+
+        if not isinstance(self.exclude_record_types, list):
+            if self.exclude_record_types is None:
+                self.exclude_record_types = []
+            else:
+                self.exclude_record_types = [str(self.exclude_record_types)]
+        self.exclude_record_types = [str(value).strip() for value in self.exclude_record_types if str(value).strip()]
         
         # Ensure match_phrase_slop is a list
         if not isinstance(self.match_phrase_slop, list):
@@ -91,6 +116,42 @@ class ElasticsearchQueryBenchmark:
         """Check if the text contains only a single word"""
         words = re.findall(r'\b\w+\b', text.strip())
         return len(words) == 1
+
+    def _query_fields(self) -> List[str]:
+        fields = [self.search_field]
+        if self.fallback_search_field and self.fallback_search_field != self.search_field:
+            fields.append(self.fallback_search_field)
+        return fields
+
+    def _highlight_fields(self, fragment_size: int = 150, number_of_fragments: int = 3) -> Dict[str, Any]:
+        return {
+            field: {
+                "fragment_size": fragment_size,
+                "number_of_fragments": number_of_fragments,
+                "pre_tags": ["<MATCH>"],
+                "post_tags": ["</MATCH>"],
+                "require_field_match": True,
+            }
+            for field in self._query_fields()
+        }
+
+    def _build_query_with_filters(self, query_clause: Dict[str, Any]) -> Dict[str, Any]:
+        bool_query: Dict[str, Any] = {"must": [query_clause]}
+        if self.exclude_record_types:
+            bool_query["must_not"] = [{"terms": {"record_type": self.exclude_record_types}}]
+        return {"bool": bool_query}
+
+    def _multi_field_clause(self, per_field_builder):
+        fields = self._query_fields()
+        clauses = [per_field_builder(field) for field in fields]
+        if len(clauses) == 1:
+            return clauses[0]
+        return {
+            "bool": {
+                "should": clauses,
+                "minimum_should_match": 1,
+            }
+        }
          
     def _check_elasticsearch_health(self) -> bool:
         """Check if Elasticsearch is responsive and healthy"""
@@ -172,25 +233,17 @@ class ElasticsearchQueryBenchmark:
                 # Long queries: require majority
                 match_config["minimum_should_match"] = "70%"
 
+        query_clause = self._multi_field_clause(
+            lambda field: {"match": {field: match_config}}
+        )
+
         query = {
-            "query": {
-                "match": {
-                    "text": match_config
-                }
-            },
+            "query": self._build_query_with_filters(query_clause),
             "track_total_hits": True,
             "size": 10,
             "_source": True,
             "highlight": {
-                "fields": {
-                    "text": {
-                        "fragment_size": 150,
-                        "number_of_fragments": 3,
-                        "pre_tags": ["<MATCH>"],
-                        "post_tags": ["</MATCH>"],
-                        "require_field_match": True
-                    }
-                }
+                "fields": self._highlight_fields(fragment_size=150, number_of_fragments=3)
             },
             "timeout": "30s"
         }
@@ -204,26 +257,18 @@ class ElasticsearchQueryBenchmark:
         
         if slop > 0:
             match_phrase_config["slop"] = slop
+
+        query_clause = self._multi_field_clause(
+            lambda field: {"match_phrase": {field: match_phrase_config}}
+        )
         
         query = {
-            "query": {
-                "match_phrase": {
-                    "text": match_phrase_config
-                }
-            },
+            "query": self._build_query_with_filters(query_clause),
             "track_total_hits": True,
             "size": 10,
             "_source": True,
             "highlight": {
-                "fields": {
-                    "text": {
-                        "fragment_size": 150,
-                        "number_of_fragments": 3,
-                        "pre_tags": ["<MATCH>"],
-                        "post_tags": ["</MATCH>"],
-                        "require_field_match": True
-                    }
-                }
+                "fields": self._highlight_fields(fragment_size=150, number_of_fragments=3)
             },
             "timeout": "60s"
         }
@@ -242,23 +287,14 @@ class ElasticsearchQueryBenchmark:
         else:
             print(f"    Executing wildcard_query on single word: '{text}'")
             wildcard_text = f"*{text.lower()}*"
+            query_clause = self._multi_field_clause(
+                lambda field: {"wildcard": {f"{field}.exact": wildcard_text}}
+            )
             query = {
-                "query": {
-                    "wildcard": {
-                        "text.exact": wildcard_text
-                    }
-                },
+                "query": self._build_query_with_filters(query_clause),
                 "size": 100,
                 "highlight": {
-                    "fields": {
-                        "text": {
-                            "fragment_size": 200,
-                            "number_of_fragments": 5,
-                            "pre_tags": ["<MATCH>"],
-                            "post_tags": ["</MATCH>"],
-                            "require_field_match": True
-                        }
-                    }
+                    "fields": self._highlight_fields(fragment_size=200, number_of_fragments=5)
                 }
             }
             return self._make_request('POST', f"{self.index_name}/_search", query)
@@ -279,56 +315,45 @@ class ElasticsearchQueryBenchmark:
             else:
                 min_should_match = "70%"
             query = {
-                "query": {
-                    "multi_match": {
-                        "query": query_text,
-                        "fields": ["text"],
-                        "fuzziness": "AUTO",  
-                        "operator": "or",
-                        "max_expansions": 20,
-                        "minimum_should_match": min_should_match
+                "query": self._build_query_with_filters(
+                    {
+                        "multi_match": {
+                            "query": query_text,
+                            "fields": self._query_fields(),
+                            "fuzziness": "AUTO",
+                            "operator": "or",
+                            "max_expansions": 20,
+                            "minimum_should_match": min_should_match,
+                        }
                     }
-                },
+                ),
                 "track_total_hits": True,
                 "size": 10,
                 "_source": True,
                 "highlight": {
-                    "fields": {
-                        "text": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3,
-                            "pre_tags": ["<MATCH>"],
-                            "post_tags": ["</MATCH>"],
-                            "require_field_match": True
-                        }
-                    }
+                    "fields": self._highlight_fields(fragment_size=150, number_of_fragments=3)
                 },
                 "timeout": "30s"
             }
         else:
             print(f"    Executing fuzzy_query on single word: '{text}'")
-            query = {
-                "query": {
+            query_clause = self._multi_field_clause(
+                lambda field: {
                     "fuzzy": {
-                        "text": {
+                        field: {
                             "value": text,
                             "fuzziness": "AUTO"
                         }
                     }
-                },
+                }
+            )
+            query = {
+                "query": self._build_query_with_filters(query_clause),
                 "track_total_hits": True,
                 "size": 10,
                 "_source": True,
                 "highlight": {
-                    "fields": {
-                        "text": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3,
-                            "pre_tags": ["<MATCH>"],
-                            "post_tags": ["</MATCH>"],
-                            "require_field_match": True
-                        }
-                    }
+                    "fields": self._highlight_fields(fragment_size=150, number_of_fragments=3)
                 }
             }
         return self._make_request('POST', f"{self.index_name}/_search", query)
@@ -340,25 +365,19 @@ class ElasticsearchQueryBenchmark:
             if len(words) < 2:
                 words = [text, text]
             
-            must_clauses = [{"match": {"text": word}} for word in words]
-            query = {
-                "query": {
+            query_clause = self._multi_field_clause(
+                lambda field: {
                     "bool": {
-                        "must": must_clauses
+                        "must": [{"match": {field: word}} for word in words]
                     }
-                },
+                }
+            )
+            query = {
+                "query": self._build_query_with_filters(query_clause),
                 "size": 50,
                 "_source": True,
                 "highlight": {
-                    "fields": {
-                        "text": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3,
-                            "pre_tags": ["<MATCH>"],
-                            "post_tags": ["</MATCH>"],
-                            "require_field_match": True
-                        }
-                    }
+                    "fields": self._highlight_fields(fragment_size=150, number_of_fragments=3)
                 }
             }
         else:
@@ -366,35 +385,52 @@ class ElasticsearchQueryBenchmark:
             if len(words) < 2:
                 words = [text, text]
             
-            should_clauses = [{"match": {"text": word}} for word in words]
-            
-            bool_query = {
-                "should": should_clauses
-            }
-            
-            if self.bool_must_minimum_should_match is not None:
-                bool_query["minimum_should_match"] = self.bool_must_minimum_should_match
+            def build_field_bool(field: str) -> Dict[str, Any]:
+                bool_query = {
+                    "should": [{"match": {field: word}} for word in words]
+                }
+
+                if self.bool_must_minimum_should_match is not None:
+                    bool_query["minimum_should_match"] = self.bool_must_minimum_should_match
+                return {"bool": bool_query}
+
+            query_clause = self._multi_field_clause(build_field_bool)
             
             query = {
-                "query": {
-                    "bool": bool_query
-                },
+                "query": self._build_query_with_filters(query_clause),
                 "size": 50,
                 "_source": True,
                 "highlight": {
-                    "fields": {
-                        "text": {
-                            "fragment_size": 150,
-                            "number_of_fragments": 3,
-                            "pre_tags": ["<MATCH>"],
-                            "post_tags": ["</MATCH>"],
-                            "require_field_match": True
-                        }
-                    }
+                    "fields": self._highlight_fields(fragment_size=150, number_of_fragments=3)
                 }
             }
             
         return self._make_request('POST', f"{self.index_name}/_search", query)
+
+    def _extract_display_snippet(self, hit: Dict[str, Any], limit: int = 300) -> Tuple[str, str]:
+        highlight = hit.get('highlight', {})
+        for field in self._query_fields():
+            if field in highlight:
+                highlighted_fragments = highlight[field]
+                return ' | '.join(highlighted_fragments), "HIGHLIGHTED"
+
+        source = hit.get('_source', {})
+        for field in self._query_fields() + ['text']:
+            source_text = source.get(field, '')
+            if source_text:
+                snippet = source_text[:limit] + ('...' if len(source_text) > limit else '')
+                return snippet, "SOURCE_TEXT"
+
+        return "", "SOURCE_TEXT"
+
+    @staticmethod
+    def _extract_agent_fields(hit: Dict[str, Any]) -> Dict[str, Any]:
+        agent = hit.get('_source', {}).get('agent', {}) or {}
+        return {
+            "agent_metadata": agent.get("metadata", {}),
+            "agent_trust": agent.get("trust", {}),
+            "agent_affordances": agent.get("affordances", {}),
+        }
     
     def extract_hit_snippets_fineweb(self, hits_data: list, max_hits: int = 5) -> str:
         """Extract top N hit snippets for Fineweb dataset"""
@@ -406,15 +442,7 @@ class ElasticsearchQueryBenchmark:
             score = hit.get('_score', 0)
             url = hit.get('_source', {}).get('url', 'No URL available')
             document_id = hit.get('_source', {}).get('document_id', 'No document_id available')
-        
-            if 'highlight' in hit and 'text' in hit['highlight']:
-                highlighted_fragments = hit['highlight']['text']
-                text_snippet = ' | '.join(highlighted_fragments)
-                snippet_source = "HIGHLIGHTED"
-            else:
-                source_text = hit.get('_source', {}).get('text', '')
-                text_snippet = source_text[:300] + ('...' if len(source_text) > 300 else '')
-                snippet_source = "SOURCE_TEXT"
+            text_snippet, snippet_source = self._extract_display_snippet(hit, limit=300)
             
             text_snippet = ' '.join(text_snippet.split())
             snippet_info = f"Hit {i+1} (Score: {score:.3f}, URL: {url}, Document_ID: {document_id}, Type: {snippet_source}): {text_snippet}"
@@ -432,15 +460,7 @@ class ElasticsearchQueryBenchmark:
             score = hit.get('_score', 0)
             conversation_id = hit.get('_source', {}).get('conversation_id', 'No conversation_id available')
             original_metadata = hit.get('_source', {}).get('original_metadata', 'No original_metadata available')
-        
-            if 'highlight' in hit and 'text' in hit['highlight']:
-                highlighted_fragments = hit['highlight']['text']
-                text_snippet = ' | '.join(highlighted_fragments)
-                snippet_source = "HIGHLIGHTED"
-            else:
-                source_text = hit.get('_source', {}).get('text', '')
-                text_snippet = source_text[:300] + ('...' if len(source_text) > 300 else '')
-                snippet_source = "SOURCE_TEXT"
+            text_snippet, snippet_source = self._extract_display_snippet(hit, limit=300)
             
             text_snippet = ' '.join(text_snippet.split())
             snippet_info = f"Hit {i+1} (Score: {score:.3f}, Conversation_ID: {conversation_id}, Original_Metadata: {original_metadata}, Type: {snippet_source}): {text_snippet}"
@@ -456,15 +476,7 @@ class ElasticsearchQueryBenchmark:
         snippets = []
         for i, hit in enumerate(hits_data[:max_hits]):
             score = hit.get('_score', 0)
-
-            if 'highlight' in hit and 'text' in hit['highlight']:
-                highlighted_fragments = hit['highlight']['text']
-                text_snippet = ' | '.join(highlighted_fragments)
-                snippet_source = "HIGHLIGHTED"
-            else:
-                source_text = hit.get('_source', {}).get('text', '')
-                text_snippet = source_text[:300] + ('...' if len(source_text) > 300 else '')
-                snippet_source = "SOURCE_TEXT"
+            text_snippet, snippet_source = self._extract_display_snippet(hit, limit=300)
             
             text_snippet = ' '.join(text_snippet.split())
             snippet_info = f"Hit {i+1} (Score: {score:.3f}, Type: {snippet_source}): {text_snippet}"
@@ -479,20 +491,30 @@ class ElasticsearchQueryBenchmark:
         
         full_text_hits = []
         for i, hit in enumerate(hits_data[:max_hits]):
+            source = hit.get('_source', {})
+            full_text = ""
+            for field in self._query_fields() + ['text']:
+                value = source.get(field, "")
+                if value:
+                    full_text = value
+                    break
+
             hit_info = {
                 'rank': i + 1,
                 'score': hit.get('_score', 0),
-                'full_text': hit.get('_source', {}).get('text', '')
+                'full_text': full_text,
             }
             
             if self.dataset.lower() == 'sft':
                 hit_info['conversation_id'] = hit.get('_source', {}).get('conversation_id', '')
                 hit_info['original_metadata'] = hit.get('_source', {}).get('original_metadata', '')
             elif self.dataset.lower() == 'fineweb':
-                hit_info['url'] = hit.get('_source', {}).get('url', '')
-                hit_info['document_id'] = hit.get('_source', {}).get('document_id', '')
+                hit_info['url'] = source.get('url', '')
+                hit_info['document_id'] = source.get('document_id', '')
             elif self.dataset.lower() == 'pure_text':
                 pass
+
+            hit_info.update(self._extract_agent_fields(hit))
             
             full_text_hits.append(hit_info)
         
@@ -817,6 +839,12 @@ def main():
     
     parser.add_argument("--dataset", choices=['fineweb', 'sft', 'pure_text'], default='fineweb',
                        help="Dataset type: 'fineweb' or 'sft' or 'pure_text' (default: fineweb)")
+    parser.add_argument("--search-field", default="search_text",
+                       help="Primary searchable field (default: search_text)")
+    parser.add_argument("--fallback-search-field", default="text",
+                       help="Fallback searchable field for legacy indexes (default: text)")
+    parser.add_argument("--exclude-record-types", default="status",
+                       help="Comma-separated record_type values to exclude from search results (default: status)")
 
     args = parser.parse_args()
 
@@ -836,6 +864,12 @@ def main():
             print(f"Error parsing configuration JSON: {e}")
             sys.exit(1)
 
+    excluded_record_types = [
+        value.strip()
+        for value in (args.exclude_record_types or "").split(",")
+        if value.strip()
+    ]
+
     print("=" * 80)
     print("Elasticsearch Search Pipeline Starting...")
     print("=" * 80)
@@ -850,6 +884,9 @@ def main():
     print(f"ES URL: {args.es_url}")
     print(f"Output Base Directory: {args.output_dir_base}")
     print(f"Dataset: {args.dataset}")
+    print(f"Search Field: {args.search_field}")
+    print(f"Fallback Search Field: {args.fallback_search_field}")
+    print(f"Excluded Record Types: {args.exclude_record_types}")
     print(f"Configuration: {config}")
     print("=" * 80)
     
@@ -865,7 +902,15 @@ def main():
         print("PROCESSING DIRECT INPUT STRING")
         print("=" * 80)
 
-        benchmark = ElasticsearchQueryBenchmark(args.es_url, args.index_name, args.dataset, config)
+        benchmark = ElasticsearchQueryBenchmark(
+            args.es_url,
+            args.index_name,
+            args.dataset,
+            config,
+            search_field=args.search_field,
+            fallback_search_field=args.fallback_search_field,
+            exclude_record_types=excluded_record_types,
+        )
 
         # Test ES connection
         try:
@@ -919,7 +964,15 @@ def main():
         print(f"Results for this CSV will be saved to: {csv_output_dir}")
         
         # Initialize benchmark with configuration for this CSV
-        benchmark = ElasticsearchQueryBenchmark(args.es_url, args.index_name, args.dataset, config)
+        benchmark = ElasticsearchQueryBenchmark(
+            args.es_url,
+            args.index_name,
+            args.dataset,
+            config,
+            search_field=args.search_field,
+            fallback_search_field=args.fallback_search_field,
+            exclude_record_types=excluded_record_types,
+        )
 
         # Test ES connection (only on first CSV)
         if csv_idx == 1:
